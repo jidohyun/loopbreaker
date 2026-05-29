@@ -1,0 +1,94 @@
+// ============ contracts.ts — 단일 SSOT 타입/스키마 (데이터모델 영역이 소유, 전 영역 import) ============
+
+// ---- 1. 파서 출력 (파서→탐지→평가 공통 입력) ----
+type ResultClass = 'ok'|'error'|'rejected'|'blocked'|'empty'|'unknown'
+type AgentScope = 'root' | string  // 'root' 또는 agentId (서브에이전트)
+interface NormalizedEvent {
+  uuid: string; parentUuid: string|null; sessionId: string; cwd: string
+  agentScope: AgentScope            // isSidechain+서브에이전트 경로로 도출 (actor 식별 핵심)
+  isSidechain: boolean
+  ts: number                        // epoch ms
+  byteOffset: number                // 파일 내 append 순서 = 정렬 3차 키 (진실의 원천)
+  kind: 'user'|'assistant'|'system'|'attachment'|'tool_use'|'tool_result'|'other'
+  tool?: string; input?: unknown
+  resultClass?: ResultClass; toolUseId?: string
+  text?: string                     // 완료선언/메시지 텍스트
+  reasoning?: string                // privacy.embedReasoning=false면 undefined
+  systemSubtype?: string; interruptedMessageId?: string
+}
+// 도출 함수 (파서 영역이 구현, 테스트 가능):
+//   normalize(raw): NormalizedEvent
+//   classifyResult(userRec, toolUseResult, asstMeta): ResultClass
+//     우선순위 blocked(hook deny) > rejected(perm 거부) > error(is_error||toolUseResult.error||isApiErrorMessage)
+//     > empty(빈 tool_result) > ok > unknown
+//   orderEvents(raw[]): NormalizedEvent[]   // 1차 ts, 2차 parentUuid 위상, 3차 byteOffset
+//     고아(부모 미도착)는 최대 N개/T초 버퍼 후 flag 부착 flush. live tail/replay 동일 통과.
+
+// ---- 2. 탐지 중간/최종 산출물 (모든 레이어 보존 — ablation 측정용) ----
+interface ActionTriple { tool: string; argKey: string; resultClass: ResultClass; ref: {uuid:string; ts:number} }
+interface StructureGateResult {          // = 기존 StructuralCandidate
+  type: 'thrashing'|'false_success'; subtype: string
+  severity: 'warning'|'critical'; sessionId: string; agentScope: AgentScope
+  windowRefs: string[]; metrics: Record<string, number>
+}
+interface EmbeddingSimilarityResult { maxCosine: number; clusterId?: number; pairs: {a:string; b:string; cos:number}[] }
+interface JudgeVerdict {
+  kind: 'thrashing'|'false_success'|'none'; subtype: string
+  confidence: number; topicDivergence?: number; circularReference?: boolean
+  reason: string; rawSamples: unknown[]   // self-consistency N개 응답 (편향완화 감사용)
+}
+interface DetectionSignals {              // 다신호 — 단일 시간임계 금지
+  temporalProximityMs?: number; sameAuthorContext?: boolean
+  circularReference?: boolean; topicDivergence?: number
+  structuralRepeatCount?: number; maxCosine?: number
+}
+interface DetectionVerdict {              // = 평가 영역의 DetectionVerdict & 탐지 영역의 Detection (동일물)
+  kind: 'thrashing'|'false_success'|'none'; subtype: string
+  confidence: number; signals: DetectionSignals
+  evidence: {uuid:string; ts:number; note:string}[]; reason: string
+}
+interface DetectionRecord {               // 파이프라인이 누적 보존 (평가가 레이어별 채점)
+  gate: StructureGateResult; embed?: EmbeddingSimilarityResult
+  judge?: JudgeVerdict; final: DetectionVerdict
+}
+// 함수: buildTriple(ev)->ActionTriple, runStructuralGate(ev,state)->StructureGateResult|null,
+//   runSemanticThrashing(ctx)->Promise<EmbeddingSimilarityResult>,
+//   runJudgeFalseSuccess(ctx)->Promise<JudgeVerdict>, synthesize(...)->DetectionVerdict
+
+// ---- 3. 설정 (탐지 런타임 + 평가 캘리브레이션이 동일 파일 로드, 코드 상수 금지) ----
+interface DetectorConfig {
+  WARNING: number; CRITICAL: number; circuitBreaker: number; historySize: number
+  errLoopWarn: number; errLoopCrit: number; fileEditWarn: number; fileEditCrit: number
+  simThresh: number; decideThresh: number
+  selfApprovalMs: number; selfApprovalCriticalMs: number
+  judgeSelfConsistencyN: number; judgePositionSwaps: number
+  embedModelId: string; judgeModelId: string
+}
+interface CalibrationGrid { /* DetectorConfig 부분필드의 candidate[] 격자 */ }
+// 기본값: WARNING=10 CRITICAL=20 circuitBreaker=30 historySize=30 errLoopWarn=3 errLoopCrit=5
+//   fileEditWarn=5 fileEditCrit=8 simThresh=0.90 decideThresh=0.7 selfApprovalMs=15000 selfApprovalCriticalMs=1000
+//   (단일 기본값만 박고, 0.85~0.95 같은 범위는 CalibrationGrid에만)
+
+// ---- 4. SQLite 스키마 (WAL 모드. 운영=loopbreaker.db, 평가=loopbreaker-eval.db 분리) ----
+// events(uuid PK, parent_uuid, session_id, cwd, agent_scope, is_sidechain, ts, byte_offset, kind, tool, input_json, result_class, tool_use_id, text, system_subtype)
+// embeddings(cache_key PK = hash(argKey)+':'+embed_model_id, embed_model_id, dim, vector BLOB)  -- sqlite-vec
+// detections(id PK, session_id, agent_scope, kind, subtype, confidence, signals_json, evidence_json, reason, created_at, is_replay)
+// gold_labels(id PK, session_id, kind, subtype, label('positive'|'negative'),
+//   anchor_uuid, start_uuid, end_uuid, window_id, source('live_jsonl'|'synthetic'|'dohyun_adapted'), origin_path,
+//   expected_signal, features_available_json, labeler_id, label_round, labeled_at)  -- span(thrashing)+point(fake_success) 겸용
+// eval_metrics(run_id PK, config_json, precision, recall, f1, kappa, balanced_acc, support_json, created_at)
+// mock_cache(cache_key PK = hash(input)+':'+model_id, model_id, response_json)  -- 평가 DB에만
+
+// ---- 5. 평가/리플레이 ----
+// ReplayEvent = NormalizedEvent (동일 정렬기 통과). GoldSampleEnvelope = {events: NormalizedEvent[], labels: GoldLabel[]}
+// 매칭규칙: thrashing=예측윈도 vs gold span IoU>=임계 → TP / fake_success=anchor_uuid ±k 이벤트 매칭
+// 클래스당 양성 <15건이면 F1/κ 대신 정성분석 폴백 (리포트에 명시)
+
+// ---- 표준화 결정 요약 ----
+// (a) Detection 동의어 통일: 탐지의 Detection ≡ 평가의 DetectionVerdict (단일 이름 DetectionVerdict)
+// (b) StructuralCandidate ≡ StructureGateResult (단일 이름 StructureGateResult)
+// (c) 모든 임계 → DetectorConfig 외부화, 코드 상수 금지, 평가가 같은 config 덮어씀
+// (d) self_approval = 다신호(temporal+sameAuthorContext+circularReference+topicDivergence), 시간 단일신호 폐기
+// (e) 캐시 키 = 입력해시 + ':' + modelId (임베딩·judge 동일 규칙), sqlite-vec에 embed_model_id+dim
+// (f) 정렬 = ts > parentUuid위상 > byteOffset, 고아 버퍼 후 flag flush, live=replay 동일 경로
+// (g) DB = 운영/평가 분리, WAL, 평가는 운영 임베딩 캐시에 read-only

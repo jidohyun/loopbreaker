@@ -1,0 +1,59 @@
+goal: >
+  LoopBreaker의 M0 마일스톤 — TypeScript/Node.js 프로젝트 골격과 단일 표준 contracts.ts,
+  SQLite 마이그레이션 러너를 구축한다. LoopBreaker는 코딩 AI 에이전트(Claude Code)의 세션
+  JSONL을 macOS 로컬에서 실시간 분석해 의미적 실패(thrashing 헛돌기 / false_success 가짜성공)를
+  탐지하고 근거와 함께 사람을 호출하는 read-only 미들웨어다. 전체 설계는 docs/SPEC.md가
+  진실의 원천(SSOT)이며, M0는 그 위에 후속 마일스톤(M1~M6)이 쌓일 토대만 만든다.
+
+constraints:
+  - Node.js >= 20, TypeScript (ESM). 런타임 단일화 — 보조 외엔 Python 미사용.
+  - macOS 전용 MVP (크로스플랫폼은 후속 마일스톤).
+  - 모든 타입/스키마/enum은 docs/SPEC.md "1. 공유 계약 — contracts.ts"를 정본으로 따른다.
+    docs/SPEC.md "1-1. 정합화 패치 노트"의 7개 BLOCKER 정본 규칙을 반드시 준수한다.
+  - enum 단일화 — 실패 종류는 'false_success' 단일 리터럴 (fake_success/fakeSuccess 금지).
+  - 모든 임계값은 DetectorConfig로 외부화 — 코드 상수 금지.
+  - 캐시 키 = 입력해시 + ':' + modelId (임베딩·judge 공통).
+  - SQLite는 better-sqlite3 + sqlite-vec, WAL 모드. 운영 DB(loopbreaker.db)와
+    평가 DB(loopbreaker-eval.db)를 분리한다.
+  - sqlite-vec 벡터 차원은 DDL에 매직넘버 하드코딩 금지 — config.embedDim에서 마이그레이션 시 생성.
+  - 임베딩 provider는 Voyage 또는 OpenAI (Anthropic은 임베딩 API 없음). judge만 Anthropic.
+  - M0 범위를 넘는 구현 금지 — 탐지/judge/알림 로직은 M1 이후. M0는 골격·타입·DB 토대만.
+  - 시크릿·API키·*.db 파일은 .gitignore로 보호. 코드에 하드코딩 금지.
+  - 사용자 코딩 규칙 준수: 불변성(no mutation), 작은 파일(200~400줄), 포괄적 에러 처리,
+    입력 검증(zod), console.log 금지.
+
+acceptance_criteria:
+  - "package.json이 존재하고 Node>=20·ESM·TypeScript로 구성되며 build/test/typecheck 스크립트가 정의됨"
+  - "tsconfig.json이 strict 모드로 설정됨"
+  - "src/contracts.ts가 docs/SPEC.md §1의 모든 타입(ResultClass, AgentScope, NormalizedEvent, ActionTriple, StructureGateResult, EmbeddingSimilarityResult, JudgeVerdict, DetectionSignals, DetectionVerdict, DetectionRecord, DetectorConfig)을 정확히 정의하고 export함"
+  - "실패 종류 enum이 'false_success'로 단일화되어 있고 코드 전체에서 일관됨 (fake_success/fakeSuccess 미출현)"
+  - "DetectorConfig가 평면 구조로 정의되고, 기본값(WARNING=10 CRITICAL=20 circuitBreaker=30 historySize=30 errLoopWarn=3 errLoopCrit=5 fileEditWarn=5 fileEditCrit=8 simThresh=0.90 decideThresh=0.7 selfApprovalMs=15000 selfApprovalCriticalMs=1000)을 담은 config 로더가 ~/.loopbreaker/config.* 에서 읽고 zod로 검증함"
+  - "SQLite 마이그레이션 러너가 schema_version 테이블을 관리하고 순차 멱등 적용하며, 운영 DB와 평가 DB를 분리 생성함"
+  - "운영 DB 초기 스키마(events, embeddings[sqlite-vec], detections, watch_offsets, detector_config)와 평가 DB 초기 스키마(gold_labels, eval_metrics, mock_cache)가 docs/SPEC.md §3 DDL대로 마이그레이션으로 생성됨"
+  - "embeddings 가상 테이블의 벡터 차원이 config.embedDim에서 동적 생성됨 (매직넘버 1024 하드코딩 없음)"
+  - "디렉터리 구조가 docs/SPEC.md §2 '5. 디렉터리/모듈 구조'를 따름 (src/daemon, src/watch, src/ingest, src/detect, src/api, src/notify, src/storage 등 — M0는 빈 스텁이라도 경계 확립)"
+  - ".gitignore가 *.db, .env, node_modules, ~/.loopbreaker 시크릿을 제외함"
+  - "npm run typecheck가 에러 없이 통과함"
+  - "마이그레이션 러너와 contracts·config에 대한 단위 테스트가 있고 npm test가 통과함 (커버리지 80% 목표)"
+
+evaluation_principles:
+  - principle: "contracts.ts가 SPEC §1/§1-1과 정확히 일치 (7 BLOCKER 정본 규칙 준수)"
+    weight: 0.30
+  - principle: "마이그레이션 러너·DB 스키마가 SPEC §3 DDL과 일치하고 멱등·분리(운영/평가) 동작"
+    weight: 0.25
+  - principle: "타입 안전성 — strict TS, typecheck 통과, zod 입력 검증"
+    weight: 0.20
+  - principle: "테스트 존재·통과 (마이그레이션·config·contracts 단위 테스트)"
+    weight: 0.15
+  - principle: "M0 범위 준수 — 탐지/judge/알림 로직으로 새지 않음, 골격·토대만"
+    weight: 0.10
+
+exit_conditions:
+  - "모든 acceptance_criteria 충족 + npm run typecheck·npm test 통과"
+  - "M0 토대 위에 M1(파서+저장)을 바로 시작할 수 있는 상태"
+
+metadata:
+  project: LoopBreaker
+  milestone: M0
+  spec_ref: docs/SPEC.md
+  ambiguity_score: 0.15
