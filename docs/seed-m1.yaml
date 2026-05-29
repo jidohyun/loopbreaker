@@ -1,0 +1,81 @@
+goal: "LoopBreaker M1 마일스톤 — 파서 + 저장. Claude Code 세션 JSONL을 읽어 NormalizedEvent로 정규화(normalize)하고, 결과를 분류(classifyResult)하고, 인과순서로 정렬(orderEvents)한 뒤, chokidar로 실시간 테일링하며 바이트 오프셋 증분 파싱으로 events 테이블에 무손실 적재한다. M0가 만든 contracts.ts·config·SQLite 마이그레이션 위에 쌓는다. docs/SPEC.md가 진실의 원천(SSOT)이며, 특히 §2(아키텍처 ingest 영역)·§4(탐지 파서 계약)·§1-1 정합화 패치노트(C5/M5/정렬계약)를 정본으로 따른다."
+
+constraints:
+  - "M0 산출물을 재사용·확장한다. contracts.ts(SSOT 타입)·config-loader·migrations·storage를 import하며 재정의 금지."
+  - "모든 타입은 contracts.ts 정본. NormalizedEvent/ResultClass/AgentScope를 그대로 사용."
+  - "classifyResult 우선순위(BLOCKER 정합화): blocked(hook deny) > rejected(perm 거부) > error(is_error||toolUseResult.error||isApiErrorMessage) > empty(빈 tool_result) > ok > unknown. is_error는 선택적 키이므로 단일 신호 금지."
+  - "C5 events 컬럼 매핑: Claude Code JSONL 원시키 → contracts 컬럼명(cwd, agent_scope, is_sidechain, kind, tool, input_json, result_class). agentScope는 isSidechain+서브에이전트 경로에서 도출."
+  - "정렬 계약: 1차 ts, 2차 parentUuid 위상순서, 3차 byteOffset(파일 내 append 순서=진실의 원천). 고아(부모 미도착) 레코드는 orphanTimeoutMs까지 버퍼 후 flag 부착 flush. live tail과 replay가 동일 정렬기 통과."
+  - "증분 파싱: 바이트 오프셋 기반 tail, 미완성 부분 라인 버퍼링(fsync 전 부분 쓰기 대응), 파싱 실패 라인은 parse_ok=0으로 저장하고 건너뜀(전체 중단 금지). watch_offsets 테이블로 재개 상태 저장(로테이션/truncate/inode 변경 대응)."
+  - "버전 가드: JSONL top-level version 필드 확인, 알 수 없는 record type은 kind='other'로 허용(중단 금지)."
+  - "chokidar 재귀 watch, **/subagents/**/agent-*.jsonl 포함. macOS fs.watch 누락 대응 폴링 백업."
+  - "경로 인코딩은 lossy이므로 프로젝트 식별은 레코드 내부 cwd 필드 사용(디렉터리명 역산 금지)."
+  - "M1 범위: 파서+저장+실시간 테일링까지. 탐지(구조게이트/의미/judge)·알림은 M2 이후. 읽기 전용(에이전트 개입 없음)."
+  - "Node.js >= 20, TypeScript ESM, strict. better-sqlite3 단일 writer + WAL."
+  - "사용자 코딩 규칙: 불변성(no mutation), 작은 파일(200~400줄), 포괄적 에러 처리, zod 입력 검증, console.log 금지(CLI 진입점 제외)."
+
+acceptance_criteria:
+  - "src/ingest/parser.ts에 normalize(rawRecord)->NormalizedEvent와 classifyResult(...)->ResultClass가 구현되고 contracts 타입을 반환함"
+  - "classifyResult가 명시된 우선순위(blocked>rejected>error>empty>ok>unknown)를 따르고, is_error 단일 신호에 의존하지 않음(toolUseResult·isApiErrorMessage 병행)"
+  - "normalize가 Claude Code JSONL 원시키를 contracts 컬럼명으로 매핑하고, agentScope를 isSidechain+경로에서 도출하며, 알 수 없는 type을 kind='other'로 허용함"
+  - "src/ingest/orphan-buffer.ts에 orderEvents(raw[])->NormalizedEvent[]가 구현되고 정렬 계약(ts>parentUuid위상>byteOffset)을 따르며 고아 레코드를 orphanTimeoutMs까지 버퍼링함"
+  - "src/ingest/tail-reader.ts가 바이트 오프셋 증분 파싱 + 미완성 부분 라인 버퍼링을 구현하고 watch_offsets 테이블로 재개 상태를 저장함"
+  - "src/watch/watch-manager.ts가 chokidar로 ~/.claude/projects/**(서브에이전트 포함) 재귀 감시하고 macOS 폴링 백업을 가짐"
+  - "events 테이블 적재가 동작: 파싱된 NormalizedEvent가 M0 events 스키마(uuid PK, raw_json, parse_ok 등)에 INSERT되고 중복(uuid 충돌)은 멱등 처리됨"
+  - "리플레이 라운드트립: 기록된 JSONL을 적재→재조회했을 때 이벤트 수·순서·필드가 무손실로 보존됨(파싱 실패 라인은 parse_ok=0으로 기록)"
+  - "실제 ~/.claude 세션 JSONL 샘플(또는 픽스처)로 무손실 적재가 검증됨"
+  - "npm run typecheck가 에러 없이 통과함"
+  - "파서·orphan-buffer·tail-reader·watch-manager에 단위 테스트가 있고 npm test가 통과함(M0 175 테스트 회귀 없음, 커버리지 80% 목표)"
+
+ontology_schema:
+  name: LoopBreakerM1
+  description: "M1 파서+저장이 다루는 데이터 흐름 — JSONL 원시 라인에서 events 테이블 적재까지"
+  fields:
+    - name: RawJsonlRecord
+      type: object
+      description: "Claude Code 세션 JSONL 한 줄의 원시 객체. type/uuid/parentUuid/timestamp/sessionId/cwd/gitBranch/version/isSidechain 봉투 + message.content(tool_use/tool_result)"
+      required: true
+    - name: NormalizedEvent
+      type: object
+      description: "normalize() 출력. contracts.ts 정본 타입. raw 원시키를 contracts 컬럼명으로 매핑하고 agentScope·resultClass 도출"
+      required: true
+    - name: WatchOffset
+      type: object
+      description: "watch_offsets 테이블 행. file_path/inode/dev/byte_offset/last_complete_line_offset/partial_buffer/rotation_seq — 증분 재개 상태"
+      required: true
+    - name: OrphanBufferEntry
+      type: object
+      description: "부모(parentUuid) 미도착으로 정렬 보류된 레코드. orphanTimeoutMs 경과 시 flag 부착 flush"
+      required: false
+
+evaluation_principles:
+  - name: parser_correctness
+    description: "normalize/classifyResult가 SPEC §4 계약과 정합화 패치노트(C5/classifyResult 우선순위)를 정확히 구현"
+    weight: 0.30
+  - name: lossless_ingest
+    description: "리플레이 라운드트립 무손실 — 적재→재조회 시 이벤트 수·순서·필드 보존, 파싱 실패는 parse_ok=0으로 격리"
+    weight: 0.25
+  - name: ordering_and_orphan
+    description: "정렬 계약(ts>parentUuid위상>byteOffset)과 고아 버퍼링이 SPEC 정본대로 동작, live=replay 동일 경로"
+    weight: 0.20
+  - name: robustness
+    description: "부분 라인 버퍼링·파싱 실패 격리·버전 가드·unknown type 허용·macOS 폴링 백업 등 강건성"
+    weight: 0.15
+  - name: m0_reuse_and_tests
+    description: "M0 contracts/config/migrations 재사용(재정의 없음) + 테스트 통과(M0 회귀 없음)"
+    weight: 0.10
+
+exit_conditions:
+  - name: acceptance_met
+    description: "모든 acceptance_criteria 충족"
+    criteria: "npm run typecheck와 npm test가 에러 없이 통과하고 리플레이 라운드트립 무손실이 검증됨"
+  - name: m2_ready
+    description: "M2(구조게이트 탐지)를 바로 시작할 수 있는 상태"
+    criteria: "events 테이블에 정규화된 NormalizedEvent가 실시간 적재되어, M2 탐지가 events를 읽어 ActionTriple을 만들 수 있음"
+
+metadata:
+  project: LoopBreaker
+  milestone: M1
+  spec_ref: docs/SPEC.md
+  builds_on: M0 (commit 1bdc974)
+  ambiguity_score: 0.15
