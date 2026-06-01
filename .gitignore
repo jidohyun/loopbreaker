@@ -9,3 +9,5 @@ dist/
 .DS_Store
 .omc/
 .code-review-graph/
+coverage/
+.ouroboros/
