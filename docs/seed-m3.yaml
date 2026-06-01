@@ -1,0 +1,82 @@
+goal: "LoopBreaker M3 마일스톤 — 의미 판정(STAGE 2) + LLM-judge. M2 구조 게이트가 발화한 thrashing 후보(게이트 통과분)에 대해서만, 임베딩 코사인 유사도로 의미적 반복/수렴을 판정하고, LLM-judge(루브릭·편향완화)로 가짜성공(false_success)을 분류하여 DetectionRecord(gate→embed→judge→final)를 누적 생성한다. M0(contracts·mock_cache)·M1(parser)·M2(구조게이트·detection-pipeline) 위에 쌓는다. docs/SPEC.md가 SSOT이며 §4 STAGE2 + §5 judge + §1 EmbeddingSimilarityResult/JudgeVerdict/DetectionVerdict/DetectionRecord 정본을 따른다."
+
+constraints:
+  - "⚠️ 외부 API 절대 호출 금지: EmbedClient/JudgeClient는 인터페이스로 추상화하고, 구현은 (1)실제 API용 골격(미사용/주석)과 (2)테스트용 Mock/InMemory 구현 둘로 분리한다. 모든 단위·통합 테스트는 Mock으로만 동작하며 네트워크·API 키를 절대 요구하지 않는다. ralph는 실제 Voyage/Anthropic API를 호출하지 않는다."
+  - "B2(정본): 임베딩 provider는 Voyage 또는 OpenAI, judge는 Anthropic. EmbedClient(임베딩)와 JudgeClient(judge)를 별도 인터페이스로 분리한다. Anthropic은 임베딩 API 없음."
+  - "judge는 구조 게이트 통과분에만 호출(비용 최소화). 게이트 미통과 이벤트는 judge에 도달하지 않는다."
+  - "모킹: mock_cache 테이블(M0 평가 DB, cache_key=sha256(payload)+':'+modelId)로 결정론 응답을 채운다. MockEmbedClient/MockJudgeClient는 입력 해시→고정 응답 매핑. 캐시 미스는 테스트에서 명시적 등록(조용한 폴백 금지)."
+  - "타입은 contracts.ts 정본: EmbeddingSimilarityResult{maxCosine, pairs:{a,b,cos}[]}(BLOCKER C8 pairCount 금지), JudgeVerdict{kind('thrashing'|'false_success'|'none'), subtype, confidence, topicDivergence?, circularReference?, reason, rawSamples}(BLOCKER C1/C2), DetectionVerdict, DetectionRecord{gate, embed?, judge?, final}."
+  - "DetectionRecord 단조 누적: 각 단계(gate→embed→judge→final)는 자기 산출을 append만 하고 이전 단계 산출을 덮어쓰지 않는다. 조기 종료(의미 약함)도 그 시점까지 보존."
+  - "임베딩 캐시 키 = sha256(payload)+':'+embedModelId, judge 캐시 키 = sha256(prompt)+':'+judgeModelId (표준 e 동일 규칙)."
+  - "judge 편향완화(SPEC §5): position swap + self-consistency N개 표본 다수결. rawSamples에 N개 응답 보존(감사용). judge_self_consistency는 DetectorConfig/설정에서 주입(코드 상수 금지)."
+  - "API 실패 처리(SPEC §4): 임베딩/judge 실패·타임아웃 시 재시도(지수백오프, 상한 apiMaxRetries) 후 fail-closed(미발화) — fail-open 금지. judge 실패 시 DetectionRecord에 judgeError/deferred 표시하고 미확정."
+  - "의미 판정: 무엇을 임베딩하나(게이트 통과 트리플의 정규화 텍스트), 코사인 유사도로 윈도 내 maxCosine·pairs 산출, simThresh(DetectorConfig) 이상이면 의미적 반복 신호. false_success 판정은 judge가 담당."
+  - "M3 범위: 의미 판정 + judge + DetectionRecord까지. 알림(notify)·골드셋 평가(eval 하니스)는 M4 이후. 읽기 전용(에이전트 개입 없음)."
+  - "Node.js >= 20, TypeScript ESM strict. 작은 파일(200~400줄). 불변성(no mutation), zod 검증, console.log 금지."
+  - "통합 글루 명시(M1/M2 교훈): M2 detection-pipeline의 게이트 통과분(DetectionHit) → 의미 판정 → judge → DetectionRecord를 잇는 파이프라인이 Mock 클라이언트로 end-to-end 동작해야 함."
+
+acceptance_criteria:
+  - "src/api/embed-client.ts에 EmbedClient 인터페이스(embed(texts)->vectors)와 MockEmbedClient(결정론 고정 벡터)가 구현되고, 실제 Voyage/OpenAI 호출 골격은 분리(미사용)됨"
+  - "src/api/judge-client.ts에 JudgeClient 인터페이스(judge(prompt)->JudgeVerdict)와 MockJudgeClient(입력 해시→고정 verdict)가 구현되고, 실제 Anthropic 호출 골격은 분리됨"
+  - "src/detect/semantic-stage.ts가 게이트 통과 트리플의 임베딩 코사인 유사도로 EmbeddingSimilarityResult{maxCosine, pairs}를 산출하고 simThresh 비교로 의미 신호를 판정함(BLOCKER C8 pairs 정본)"
+  - "src/detect/judge-stage.ts가 게이트 통과분에만 JudgeClient를 호출하고, position swap + self-consistency N개 다수결로 JudgeVerdict를 산출하며 rawSamples에 N개 응답을 보존함"
+  - "judge가 false_success(가짜성공)를 분류함: 근거 없는 완료선언/자기검증 순환참조 패턴을 루브릭으로 판정(kind='false_success', BLOCKER C1)"
+  - "캐시 키가 sha256(payload)+':'+modelId 규칙을 따르고, 임베딩/judge가 mock_cache(또는 인메모리 맵)에서 결정론 응답을 조회함. 캐시 미스는 명시적 에러/등록(조용한 폴백 금지)"
+  - "API 실패 시 재시도(apiMaxRetries 상한) 후 fail-closed(미발화), judge 실패 시 DetectionRecord에 judgeError 표시. fail-open 없음"
+  - "DetectionRecord가 gate→embed→judge→final 순으로 단조 누적되고, 의미 약함/judge 미진행 시 해당 필드가 undefined로 남음(이전 단계 보존)"
+  - "통합 파이프라인: M2 게이트 통과분 → 의미 판정 → judge → DetectionRecord가 Mock 클라이언트로 end-to-end 동작(thrashing 후보에 judge 호출, 가짜성공 시퀀스에 false_success 분류)"
+  - "npm run typecheck가 에러 없이 통과함"
+  - "embed-client·judge-client·semantic-stage·judge-stage·통합 파이프라인에 단위/통합 테스트가 있고 npm test가 통과함(M2 1268 테스트 회귀 없음). 모든 테스트는 Mock으로 네트워크 없이 동작. 커버리지 80% 목표."
+
+ontology_schema:
+  name: LoopBreakerM3
+  description: "M3 의미 판정 + judge가 다루는 데이터 흐름 — 게이트 통과분에서 DetectionRecord까지"
+  fields:
+    - name: EmbeddingSimilarityResult
+      type: object
+      description: "contracts 정본. {maxCosine, clusterId?, pairs:{a,b,cos}[]}. 임베딩 코사인 유사도 산출(C8 pairs)"
+      required: true
+    - name: JudgeVerdict
+      type: object
+      description: "contracts 정본. {kind('thrashing'|'false_success'|'none'), subtype, confidence, topicDivergence?, circularReference?, reason, rawSamples}. judge 판정(C1/C2)"
+      required: true
+    - name: DetectionRecord
+      type: object
+      description: "contracts 정본. {gate, embed?, judge?, final}. gate→embed→judge→final 단조 누적"
+      required: true
+    - name: MockClient
+      type: object
+      description: "EmbedClient/JudgeClient의 결정론 Mock 구현. 입력 해시→고정 응답(mock_cache 또는 인메모리). 테스트가 네트워크 없이 동작하게 함"
+      required: true
+
+evaluation_principles:
+  - name: no_real_api
+    description: "외부 API 절대 미호출: EmbedClient/JudgeClient 인터페이스 분리 + Mock 구현, 모든 테스트가 네트워크·키 없이 결정론 동작. ralph가 실API 안 부름"
+    weight: 0.25
+  - name: semantic_correctness
+    description: "임베딩 코사인 유사도(EmbeddingSimilarityResult, C8 pairs)와 simThresh 판정이 SPEC §4 STAGE2 정본대로"
+    weight: 0.20
+  - name: judge_correctness
+    description: "judge가 게이트 통과분에만 호출, false_success 분류, position swap+self-consistency 편향완화, rawSamples 보존(SPEC §5)"
+    weight: 0.25
+  - name: record_accumulation
+    description: "DetectionRecord 단조 누적(gate→embed→judge→final), fail-closed, judgeError 처리"
+    weight: 0.15
+  - name: integration_and_m2_reuse
+    description: "M2 게이트 통과분→의미→judge end-to-end 통합(Mock) + M0/M1/M2 재사용(재정의 없음) + 테스트 통과(M2 1268 회귀 없음)"
+    weight: 0.15
+
+exit_conditions:
+  - name: acceptance_met
+    description: "모든 acceptance_criteria 충족"
+    criteria: "npm run typecheck와 npm test가 에러 없이 통과(모든 테스트 Mock·네트워크 없이)하고, 게이트 통과분에 judge 호출+false_success 분류가 통합 테스트로 검증됨"
+  - name: m4_ready
+    description: "M4(알림 + 사람 호출)를 바로 시작할 수 있는 상태"
+    criteria: "DetectionRecord(gate→embed→judge→final)가 완성되어, M4 알림이 final DetectionVerdict와 evidence를 읽어 근거 동반 알림을 만들 수 있음"
+
+metadata:
+  project: LoopBreaker
+  milestone: M3
+  spec_ref: docs/SPEC.md
+  builds_on: M2 (commit b04a745)
+  ambiguity_score: 0.15
