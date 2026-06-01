@@ -217,6 +217,16 @@ export interface DetectionRecord {
   embed?: EmbeddingSimilarityResult
   /** judge 결과 (judge 단계 미진행 시 undefined) */
   judge?: JudgeVerdict
+  /**
+   * judge API 실패 시 true.
+   * SPEC §4: judge 실패 후 재시도 소진 → judgeError:true, deferred:true 표시하고 미확정.
+   */
+  judgeError?: boolean
+  /**
+   * judge 판정 미확정(지연) 여부.
+   * judgeError:true와 함께 설정된다.
+   */
+  deferred?: boolean
   /** 최종 판정 */
   final: DetectionVerdict
 }
