@@ -1,0 +1,83 @@
+goal: "LoopBreaker M4 마일스톤 — 알림 + 사람 호출(notify). M3가 산출한 DetectionRecord.final(DetectionVerdict)을 소비해, VerdictRouter가 임계(decideThresh) 초과 + 디바운스 윈도우 통과를 판정하고, NotifyDispatcher가 근거(evidence) 동반 알림을 데스크톱(node-notifier)·웹훅(설정 시)·CLI status로 발송한다. SPEC §2(VerdictRouter/NotifyDispatcher, §2.1 (6)라우팅·(7)알림, §2.2(6) 디바운스 불변식) + §4 장애처리(judgeError→deferred→LOW_CONFIDENCE 옵션, 비용상한→메타알림 1회) + §7-2 #7 공백(알림 payload/dedup/쿨다운 스키마) 정본. M0~M3(contracts·parser·구조게이트·의미·judge·DetectionRecord) 위에 쌓는다. docs/SPEC.md가 SSOT."
+
+constraints:
+  - "⚠️ 테스트 부수효과 절대 금지(M3 모킹 원칙 계승): NotifySink를 인터페이스로 추상화하고, 구현을 (1)실제 발송용 어댑터(DesktopNotifySink=node-notifier, WebhookNotifySink=HTTP)와 (2)테스트용 MockNotifySink(발송 기록만 인메모리 수집)로 분리한다. 모든 단위·통합 테스트는 MockNotifySink로만 동작하며 실제 OS 데스크톱 알림·네트워크 HTTP를 절대 발생시키지 않는다(키·네트워크·OS 알림 요구 금지). ralph는 실제 알림을 쏘지 않는다."
+  - "사용자 결정 반영: 프로덕션 경로는 실제 node-notifier로 데스크톱 알림 발송(DesktopNotifySink 실구현). node-notifier는 실제 의존성으로 추가하되, import는 DesktopNotifySink 어댑터 안에 격리(다른 모듈/테스트가 transitively 로드해 알림을 쏘지 않게). 어댑터는 DI로 주입되며, 데몬/통합 테스트는 항상 MockNotifySink를 주입한다."
+  - "사용자 결정 반영: 디바운스/dedup/쿨다운 상태는 인메모리 맵(런타임 빠른 조회) + SQLite 영속(notifications 테이블, 데몬 재시작 후에도 쿨다운 유지) 둘 다. 부팅 시 DB에서 인메모리로 워밍업. SPEC §2.2(6) 불변식: 알림 자체가 실패해도 DetectionRecord는 이미 영속 → 손실 없음(알림 발송과 record 저장은 독립)."
+  - "VerdictRouter(SPEC §2.1 (6)): DetectionVerdict.final을 받아 (a)kind!=='none' (b)confidence>=decideThresh (c)디바운스 윈도우(notifyDebounceMs) 내 동일 (sessionId, kind) 미발송 — 셋 다 충족 시에만 RouteDecision{shouldNotify:true}. 하나라도 불충족이면 shouldNotify:false + 사유(suppressedReason: 'below_threshold'|'kind_none'|'debounced'). 결정은 순수함수(부수효과 없음)."
+  - "디바운스 키 = sessionId + '\\x1f' + kind (동일 세션·동일 실패유형). 쿨다운 = 마지막 발송 ts + notifyDebounceMs. SPEC §2.2(6) '동일 세션·동일 실패유형에 대해 notifyDebounceMs 윈도우 내 재알림 억제'."
+  - "NotificationPayload(§7-2 #7 정본 신규 정의, contracts.ts에 추가): {sessionId, kind, subtype, confidence, reason, evidence:{uuid,ts,note}[], ts, severity('critical'|'warning'|'low_confidence'|'meta'), dedupeKey}. 근거 payload = DetectionRecord의 evidence(사람 호출용). zod 스키마로 검증."
+  - "장애처리(SPEC §4): (a)judgeError/deferred인 DetectionRecord → config.lowConfidenceNotify=true면 severity='low_confidence'로 보류성 알림(기본 false=알림 안함). (b)비용상한 초과 등 메타상황 → severity='meta' 알림 1회(메타알림도 디바운스로 1회만). (c)NotifyDispatcher 발송 실패(어댑터 throw)는 잡아서 기록하고 다음 sink로 진행(한 채널 실패가 다른 채널·record를 막지 않음). 침묵 실패 금지: 발송 결과(성공/실패/채널)를 카운터/로그로 가시화."
+  - "DetectorConfig에 알림 필드 추가(평면 구조, BLOCKER C3 중첩 금지): notifyDebounceMs(number, 기본 60000), notifyChannels(('desktop'|'webhook'|'cli')[], 기본 ['desktop','cli']), webhookUrl(string|undefined), lowConfidenceNotify(boolean, 기본 false). DEFAULT_DETECTOR_CONFIG에 기본값 추가. 기존 필드/기본값은 절대 변경 금지(M0~M3 회귀 방지)."
+  - "DetectionVerdict/DetectionRecord는 M3 정본 그대로 소비만(재정의·수정 금지). contracts.ts 수정은 알림 신규 타입 추가 + DetectorConfig 알림 필드 추가로 한정. 기존 타입 시그니처 불변."
+  - "DetectionRecord 단조 누적 불변(M3 계승): M4는 record를 읽기만 하고 변경하지 않는다. 알림은 record 영속화와 독립된 후속 단계."
+  - "Node.js >= 20, TypeScript ESM strict. 작은 파일(200~400줄). 불변성(no mutation), zod 검증, console.log 금지(로깅은 주입된 logger 또는 구조화 이벤트)."
+  - "통합 글루 명시(M1~M3 교훈): M3 DetectionRecord(또는 final DetectionVerdict) → VerdictRouter → NotifyDispatcher → NotificationPayload 발송이 MockNotifySink로 end-to-end 동작해야 함. thrashing/false_success 케이스는 알림 발송, kind='none'·저신뢰도·디바운스 케이스는 미발송."
+
+acceptance_criteria:
+  - "src/contracts.ts에 NotificationPayload 인터페이스(+zod NotificationPayloadSchema)와 NotifySink 인터페이스(send(payload)->Promise<NotifyResult>), DetectorConfig 알림 필드(notifyDebounceMs/notifyChannels/webhookUrl/lowConfidenceNotify) + DEFAULT_DETECTOR_CONFIG 기본값이 추가됨. 기존 타입/기본값은 불변(M0~M3 회귀 없음)"
+  - "src/notify/verdict-router.ts의 VerdictRouter가 DetectionVerdict.final + 쿨다운상태를 받아 RouteDecision{shouldNotify, suppressedReason?, payload?}를 순수함수로 산출함. kind==='none'/confidence<decideThresh/디바운스윈도우 내 → shouldNotify:false + 사유. 셋 다 통과 → shouldNotify:true + NotificationPayload"
+  - "src/notify/cooldown-store.ts가 디바운스 상태를 인메모리 맵 + SQLite(notifications 테이블) 둘 다로 관리함. record(sessionId,kind,ts) / isWithinDebounce(sessionId,kind,now,debounceMs) / warmupFromDb(). 디바운스 키 = sessionId+\\x1f+kind"
+  - "src/notify/notify-sinks.ts에 NotifySink 구현 3종: MockNotifySink(발송 기록만 인메모리), DesktopNotifySink(node-notifier, import는 어댑터 내부 격리), WebhookNotifySink(HTTP POST, fetch는 어댑터 내부). 실 발송 어댑터는 DI로만 주입되고 테스트엔 미사용"
+  - "src/notify/notify-dispatcher.ts의 NotifyDispatcher가 NotificationPayload를 config.notifyChannels 순서대로 주입된 NotifySink들에 발송하고, 한 sink 실패(throw)를 잡아 다음 sink로 진행하며 NotifyDispatchResult{perChannel:{channel,ok,error?}[]}를 반환함(침묵 실패 금지)"
+  - "장애처리: judgeError/deferred record는 lowConfidenceNotify=true일 때만 severity='low_confidence' 알림, 기본(false)은 미발송. 메타상황(비용상한 등)은 severity='meta' 알림 1회(디바운스 적용). 발송 실패해도 예외가 파이프라인을 죽이지 않음"
+  - "통합 파이프라인(src/notify/m4-pipeline.ts 또는 동등): M3 DetectionRecord → VerdictRouter → NotifyDispatcher → MockNotifySink end-to-end. thrashing/false_success(고신뢰)→발송 1건, kind='none'→미발송, 동일(session,kind) 재입력→디바운스로 2번째 미발송, judgeError+lowConfidenceNotify=false→미발송"
+  - "npm run typecheck가 에러 없이 통과함"
+  - "verdict-router·cooldown-store·notify-sinks·notify-dispatcher·통합 파이프라인에 단위/통합 테스트가 있고 npm test가 통과함(M0~M3 기존 테스트 2630 회귀 없음). 모든 테스트는 MockNotifySink로 실제 알림·네트워크 없이 동작. 커버리지 80% 목표"
+  - "notifications 테이블 마이그레이션이 src/storage/migrations.ts에 추가되고(기존 마이그레이션 불변, append만), cooldown-store가 이 테이블로 영속/워밍업함. WAL·단일 writer 규칙(SPEC §3.1) 준수"
+
+ontology_schema:
+  name: LoopBreakerM4
+  description: "M4 알림 + 사람 호출이 다루는 데이터 흐름 — DetectionVerdict에서 발송된 NotificationPayload까지"
+  fields:
+    - name: DetectionVerdict
+      type: object
+      description: "M3 정본(읽기전용 소비). {kind,subtype,confidence,signals,evidence,reason}. VerdictRouter 입력"
+      required: true
+    - name: NotificationPayload
+      type: object
+      description: "M4 신규 정본. {sessionId,kind,subtype,confidence,reason,evidence[],ts,severity,dedupeKey}. 사람 호출용 근거 동반 알림"
+      required: true
+    - name: RouteDecision
+      type: object
+      description: "VerdictRouter 산출. {shouldNotify, suppressedReason?, payload?}. 임계+디바운스 판정 결과(순수함수)"
+      required: true
+    - name: NotifySink
+      type: object
+      description: "발송 채널 추상화. send(payload)->NotifyResult. Mock(테스트)/Desktop(node-notifier)/Webhook(HTTP) 구현. 테스트는 Mock만"
+      required: true
+
+evaluation_principles:
+  - name: no_side_effects_in_tests
+    description: "테스트 부수효과 절대 금지: NotifySink 인터페이스+MockNotifySink, 모든 테스트가 실제 OS 알림·네트워크 없이 결정론 동작. node-notifier import는 DesktopNotifySink 내부 격리. ralph가 실제 알림 안 쏨"
+    weight: 0.25
+  - name: routing_correctness
+    description: "VerdictRouter가 SPEC §2.1(6)/§2.2(6)대로 kind/confidence(decideThresh)/디바운스(notifyDebounceMs) 3조건을 순수함수로 판정, suppressedReason 정확"
+    weight: 0.20
+  - name: dispatch_and_payload
+    description: "NotifyDispatcher가 채널별 발송+한 채널 실패 격리+결과 가시화, NotificationPayload가 evidence 동반(사람호출용), §7-2 #7 스키마 정본"
+    weight: 0.20
+  - name: cooldown_persistence
+    description: "디바운스 상태 인메모리+SQLite 영속(재시작 후 쿨다운 유지), notifications 테이블 마이그레이션, 디바운스 키 정확, 단일writer/WAL 준수"
+    weight: 0.15
+  - name: failure_handling
+    description: "judgeError/deferred→lowConfidence 옵션, 메타알림 1회, 발송 실패가 파이프라인/record를 안 죽임(SPEC §4), 침묵 실패 금지"
+    weight: 0.10
+  - name: integration_and_reuse
+    description: "M3 DetectionRecord→router→dispatcher end-to-end(Mock) + M0~M3 재사용(재정의 없음, contracts 기존 타입/기본값 불변) + 테스트 통과(2630 회귀 없음)"
+    weight: 0.10
+
+exit_conditions:
+  - name: acceptance_met
+    description: "모든 acceptance_criteria 충족"
+    criteria: "npm run typecheck와 npm test가 에러 없이 통과(모든 테스트 MockNotifySink·네트워크·OS알림 없이)하고, 고신뢰 thrashing/false_success→발송·kind none/저신뢰/디바운스→미발송이 통합 테스트로 검증됨"
+  - name: m5_ready
+    description: "M5(데몬 통합 + 평가 하니스 연결)를 바로 시작할 수 있는 상태"
+    criteria: "VerdictRouter+NotifyDispatcher+CooldownStore가 완성되어, 데몬 메인루프(SPEC §3.3)가 SemanticStage/judge 후 DetectionRecord를 router→dispatcher로 흘려보내 근거 동반 알림을 발송할 수 있음"
+
+metadata:
+  project: LoopBreaker
+  milestone: M4
+  spec_ref: docs/SPEC.md
+  builds_on: M3 (commit 13a503b)
+  ambiguity_score: 0.15
