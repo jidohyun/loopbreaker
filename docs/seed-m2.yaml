@@ -1,0 +1,73 @@
+goal: "LoopBreaker M2 마일스톤 — 구조 게이트(STAGE 1). M1이 events 테이블에 적재한 NormalizedEvent를 읽어 ActionTriple(tool, argKey, resultClass, ref)을 생성하고, 슬라이딩 윈도(historySize) 안에서 반복 행동·동일 에러 수렴·동일 파일 N회 편집을 탐지해 thrashing 후보를 구조 게이트 결과(StructureGateResult)로 플래그한다. LLM 호출 0, 결정론적, 저비용. M0(contracts·migrations)·M1(parser·event-store) 위에 쌓는다. docs/SPEC.md가 SSOT이며, 특히 §4 'STAGE 1 구조 게이트' 의사코드와 §1 ActionTriple/StructureGateResult/DetectorConfig 정본을 따른다."
+
+constraints:
+  - "M0·M1 산출물을 재사용·확장한다. contracts.ts·event-store(queryEventsBySession 등)·migrations·config를 import하며 재정의 금지."
+  - "모든 타입은 contracts.ts 정본: ActionTriple{tool, argKey, resultClass, ref{uuid,ts}}, StructureGateResult{type, subtype, severity, sessionId, agentScope, windowRefs[], metrics}, DetectorConfig."
+  - "ActionTriple argKey 정규화(SPEC §4 1a): Edit는 file_path 보존+old/new를 collapseWS·editDelta 멀티셋 해시(미세변형 그룹화), Bash는 휘발성 인자(타임스탬프/포트/tmp경로) 마스킹 후 해시, Read/Glob/Grep은 정규화 경로 해시, 큰 payload는 SHA-256(sha256:<hex>)."
+  - "구조 게이트(SPEC §4 1b): (tool,argKey) 반복과 (tool,argKey,resultClass='error') 반복을 슬라이딩 윈도(historySize, 기본 30)로 카운트. repeatN>=CRITICAL(20)||errLoopN>=errLoopCrit(5)→critical, repeatN>=WARNING(10)||errLoopN>=errLoopWarn(3)→warning. 임계는 DetectorConfig에서(코드 상수 금지)."
+  - "동일 파일 N회 편집(SPEC §4 1c): file_path 단위 카운트 + editDelta 변형 그룹화. substring 단순 규칙 금지 — 정규화 토큰 Jaccard로 '같은 영역 재편집' 판정(오탐 방지). fileEditWarn(5)/fileEditCrit(8) 임계."
+  - "M2 범위: ActionTriple 생성 + 구조 게이트(thrashing 후보)까지. 의미 판정(임베딩)·LLM-judge·가짜성공·알림은 M3 이후. 가짜성공 시간프로브(self_approval)도 M3."
+  - "결정론적·읽기 전용: 구조 게이트는 LLM 호출 0, events를 읽기만 함. 에이전트 개입 없음."
+  - "Node.js >= 20, TypeScript ESM strict. 작은 파일(200~400줄). 불변성(no mutation), zod 검증, console.log 금지."
+  - "통합 글루 명시: events 읽기 → ActionTriple[] → 구조 게이트 → StructureGateResult를 잇는 파이프라인이 실제로 연결되고 end-to-end로 동작해야 함(M1 라운드트립 교훈)."
+
+acceptance_criteria:
+  - "src/detect/triple-builder.ts에 buildTriple(event)->ActionTriple|null과 argKey 정규화(Edit/Bash/Read 등 툴별)가 구현되고 contracts ActionTriple을 반환함"
+  - "Edit의 미세변형(공백/줄바꿈 차이)이 같은 argKey로 그룹화되어 '매번 다른 편집으로 보이는' 오탐을 방지함(editDelta 멀티셋 해시)"
+  - "Bash의 휘발성 인자(타임스탬프/포트/tmp경로/해시)가 마스킹되어 반복 실행이 같은 argKey로 묶임"
+  - "src/detect/structural-gate.ts에 runStructuralGate(triple, state)->StructureGateResult|null이 구현되고 슬라이딩 윈도(historySize) 반복/동일에러 카운트로 warning/critical을 판정함"
+  - "동일 파일 N회 편집 탐지가 file_path 단위로 동작하고, substring이 아닌 정규화 토큰 Jaccard로 '같은 영역 재편집'을 판정함(오탐 방지)"
+  - "모든 임계값(WARNING/CRITICAL/historySize/errLoopWarn/errLoopCrit/fileEditWarn/fileEditCrit)이 DetectorConfig에서 주입되고 코드 상수가 아님"
+  - "SessionState(슬라이딩 윈도 RingBuffer + 카운트 맵)가 세션·agentScope 단위로 관리되고 윈도 밖 트리플은 카운트에서 제거됨"
+  - "통합 파이프라인: M1 events 테이블에서 읽은 NormalizedEvent → buildTriple → runStructuralGate가 end-to-end로 연결되어, 반복 편집/동일 에러 시퀀스에 대해 thrashing 후보(StructureGateResult)가 발화함"
+  - "npm run typecheck가 에러 없이 통과함"
+  - "triple-builder·structural-gate·통합 파이프라인에 단위/통합 테스트가 있고 npm test가 통과함(M1 473 테스트 회귀 없음, 커버리지 80% 목표). 반복 시퀀스→발화, 정상 시퀀스→미발화 케이스 포함."
+
+ontology_schema:
+  name: LoopBreakerM2
+  description: "M2 구조 게이트가 다루는 데이터 흐름 — events에서 ActionTriple, 슬라이딩 윈도, thrashing 후보까지"
+  fields:
+    - name: ActionTriple
+      type: object
+      description: "contracts 정본. {tool, argKey(정규화·해시), resultClass, ref{uuid,ts}}. tool_use 이벤트에서 생성"
+      required: true
+    - name: SessionState
+      type: object
+      description: "세션·agentScope 단위 슬라이딩 윈도 상태. RingBuffer(historySize) + (argKey→count) 맵 + file_path 편집 카운트"
+      required: true
+    - name: StructureGateResult
+      type: object
+      description: "contracts 정본. {type('thrashing'), subtype, severity('warning'|'critical'), sessionId, agentScope, windowRefs[], metrics}"
+      required: true
+
+evaluation_principles:
+  - name: triple_correctness
+    description: "buildTriple과 argKey 정규화가 SPEC §4 1a 계약대로(Edit editDelta·Bash 마스킹·SHA-256) 동작하고 미세변형 그룹화로 오탐 방지"
+    weight: 0.30
+  - name: gate_correctness
+    description: "구조 게이트 슬라이딩 윈도 반복/동일에러/동일파일 편집 카운트가 SPEC §4 1b/1c 정본대로, 임계는 DetectorConfig 주입"
+    weight: 0.25
+  - name: integration_pipeline
+    description: "events→triple→gate end-to-end 연결이 실제 동작(반복→발화, 정상→미발화). M1 교훈: 통합 글루 누락 금지"
+    weight: 0.25
+  - name: scope_discipline
+    description: "M2 범위 준수: 의미/judge/가짜성공/알림으로 새지 않고 구조 게이트(thrashing 후보)만"
+    weight: 0.10
+  - name: m1_reuse_and_tests
+    description: "M0/M1 재사용(재정의 없음) + 테스트 통과(M1 473 회귀 없음)"
+    weight: 0.10
+
+exit_conditions:
+  - name: acceptance_met
+    description: "모든 acceptance_criteria 충족"
+    criteria: "npm run typecheck와 npm test가 에러 없이 통과하고, 반복 편집/동일 에러 시퀀스에 대해 thrashing 후보가 발화함이 통합 테스트로 검증됨"
+  - name: m3_ready
+    description: "M3(의미 판정 + LLM-judge)를 바로 시작할 수 있는 상태"
+    criteria: "구조 게이트가 thrashing 후보(StructureGateResult)를 산출하여, M3 의미 판정/judge가 '게이트 통과분'을 입력으로 받을 수 있음"
+
+metadata:
+  project: LoopBreaker
+  milestone: M2
+  spec_ref: docs/SPEC.md
+  builds_on: M1 (commit cf67ce3)
+  ambiguity_score: 0.15
