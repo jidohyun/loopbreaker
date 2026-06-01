@@ -32,6 +32,7 @@ export function migrate(kind: DbKind, dbPath: string, embedDim: number): void {
   const db = new Database(dbPath)
   try {
     db.pragma('journal_mode = WAL')
+    db.pragma('synchronous = NORMAL')
     if (kind === 'op') {
       // vec_embeddings 가상 테이블 생성에 sqlite-vec 확장이 필요
       loadSqliteVec(db)

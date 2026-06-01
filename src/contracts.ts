@@ -310,6 +310,29 @@ export interface DetectorConfig {
    * BLOCKER B1: DDL 생성 시 사용. 코드 상수 하드코딩 금지.
    */
   embedDim: number
+
+  // ---- 알림 설정 (M4 신규 — BLOCKER C3: 평면 구조) ----
+  /**
+   * 디바운스 윈도우 (ms).
+   * 동일 (sessionId, kind)에 대해 이 시간 내 재알림 억제.
+   * 기본값: 60000 (1분)
+   */
+  notifyDebounceMs: number
+  /**
+   * 알림 채널 목록.
+   * 기본값: ['desktop', 'cli']
+   */
+  notifyChannels: ('desktop' | 'webhook' | 'cli')[]
+  /**
+   * 웹훅 URL (webhook 채널 사용 시).
+   * undefined이면 webhook 채널 비활성.
+   */
+  webhookUrl?: string
+  /**
+   * judgeError/deferred DetectionRecord에 대해 LOW_CONFIDENCE 알림 발송 여부.
+   * 기본값: false (발송 안 함)
+   */
+  lowConfidenceNotify: boolean
 }
 
 /**
@@ -365,6 +388,97 @@ export interface CalibrationGrid {
 // (f) 정렬 = ts > parentUuid위상 > byteOffset, 고아 버퍼 후 flag flush, live=replay 동일 경로
 // (g) DB = 운영/평가 분리, WAL, 평가는 운영 임베딩 캐시에 read-only ATTACH
 
+// ---- 6. 알림 페이로드 (M4 신규 — §7-2 #7 정본) ----
+
+import { z } from 'zod'
+
+/**
+ * 알림 심각도.
+ * - 'critical'       : 고신뢰 thrashing/false_success
+ * - 'warning'        : 중간 신뢰도
+ * - 'low_confidence' : judgeError/deferred + lowConfidenceNotify=true 시
+ * - 'meta'           : 비용상한 초과 등 시스템 이벤트
+ */
+export type NotificationSeverity = 'critical' | 'warning' | 'low_confidence' | 'meta'
+
+/**
+ * 알림 페이로드 — 사람 호출용 근거 동반.
+ * §7-2 #7 정본. NotifyDispatcher가 NotifySink로 전달.
+ */
+export interface NotificationPayload {
+  /** 세션 ID */
+  sessionId: string
+  /** 탐지 종류 (DetectionVerdict.kind 와 동일) */
+  kind: 'thrashing' | 'false_success' | 'none' | 'meta'
+  /** 세부 유형 */
+  subtype: string
+  /** 신뢰도 (0~1) */
+  confidence: number
+  /** 판정 이유 */
+  reason: string
+  /** 근거 목록 (사람 호출용 evidence) */
+  evidence: { uuid: string; ts: number; note: string }[]
+  /** 알림 발생 시각 (epoch ms, UTC) */
+  ts: number
+  /** 심각도 */
+  severity: NotificationSeverity
+  /** 디바운스/dedup 키 = sessionId + '\x1f' + kind */
+  dedupeKey: string
+}
+
+/** zod 스키마 — NotificationPayload 검증 */
+export const NotificationPayloadSchema = z.object({
+  sessionId: z.string().min(1),
+  kind: z.enum(['thrashing', 'false_success', 'none', 'meta']),
+  subtype: z.string(),
+  confidence: z.number().min(0).max(1),
+  reason: z.string(),
+  evidence: z.array(
+    z.object({
+      uuid: z.string(),
+      ts: z.number(),
+      note: z.string(),
+    })
+  ),
+  ts: z.number(),
+  severity: z.enum(['critical', 'warning', 'low_confidence', 'meta']),
+  dedupeKey: z.string().min(1),
+})
+
+// ---- 7. 알림 발송 채널 추상화 (M4 신규 — §2.1 (7), 테스트 부수효과 금지) ----
+
+/**
+ * 알림 발송 결과.
+ * 각 채널 어댑터가 send() 후 반환.
+ */
+export interface NotifyResult {
+  /** 발송 성공 여부 */
+  success: boolean
+  /** 발송된 채널 식별자 */
+  channel: 'desktop' | 'webhook' | 'cli' | 'mock'
+  /** 실패 시 오류 메시지 */
+  error?: string
+}
+
+/**
+ * 알림 채널 추상화 인터페이스.
+ * 구현체:
+ *   - DesktopNotifySink  : node-notifier (실제 OS 알림)
+ *   - WebhookNotifySink  : HTTP POST
+ *   - CliNotifySink      : CLI stderr/stdout 출력
+ *   - MockNotifySink     : 테스트용 인메모리 수집 (부수효과 없음)
+ *
+ * 테스트는 반드시 MockNotifySink만 사용. 실제 OS 알림/네트워크 금지.
+ */
+export interface NotifySink {
+  /**
+   * 알림 페이로드를 발송한다.
+   * 실패 시 throw 대신 NotifyResult{success:false, error:...}를 반환.
+   * (NotifyDispatcher가 채널별 실패를 격리하기 위해 예외 대신 결과 반환 사용)
+   */
+  send(payload: NotificationPayload): Promise<NotifyResult>
+}
+
 // ---- DB 종류 구분 타입 ----
 export type DbKind = 'op' | 'eval'
 
@@ -394,4 +508,9 @@ export const DEFAULT_DETECTOR_CONFIG: DetectorConfig = {
   judgeModelId: 'claude-3-5-sonnet-20241022',
   // BLOCKER B1: DDL 생성 시 이 값 사용. 매직넘버 코드 상수 금지.
   embedDim: 1024,
+  // M4 알림 기본값
+  notifyDebounceMs: 60000,
+  notifyChannels: ['desktop', 'cli'] as ('desktop' | 'webhook' | 'cli')[],
+  webhookUrl: undefined,
+  lowConfidenceNotify: false,
 } as const

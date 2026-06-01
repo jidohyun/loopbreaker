@@ -28,6 +28,13 @@ export const detectorConfigSchema = z.object({
   judgeModelId: z.string().min(1).default(DEFAULT_DETECTOR_CONFIG.judgeModelId),
   // BLOCKER B1: embedDim은 DDL 생성 시 사용
   embedDim: z.number().int().positive().default(DEFAULT_DETECTOR_CONFIG.embedDim),
+  // ---- M4 알림 설정 (BLOCKER C3: 평면 구조) ----
+  notifyDebounceMs: z.number().int().positive().default(DEFAULT_DETECTOR_CONFIG.notifyDebounceMs),
+  notifyChannels: z.array(z.enum(['desktop', 'webhook', 'cli'])).default(
+    DEFAULT_DETECTOR_CONFIG.notifyChannels as ('desktop' | 'webhook' | 'cli')[],
+  ),
+  webhookUrl: z.string().url().optional(),
+  lowConfidenceNotify: z.boolean().default(DEFAULT_DETECTOR_CONFIG.lowConfidenceNotify),
 })
 
 // ---- Privacy 설정 ----

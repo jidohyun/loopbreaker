@@ -15,8 +15,10 @@
     "migrate:eval": "node dist/storage/migrate-cli.js eval"
   },
   "dependencies": {
+    "@types/node-notifier": "^8.0.5",
     "better-sqlite3": "^12.10.0",
     "chokidar": "^5.0.0",
+    "node-notifier": "^10.0.1",
     "sqlite-vec": "^0.1.6",
     "zod": "^3.23.8"
   },

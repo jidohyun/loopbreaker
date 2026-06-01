@@ -1,33 +1,40 @@
 /**
- * notify/index.ts — LoopBreaker 알림 모듈 스텁
+ * notify/index.ts — LoopBreaker 알림 모듈 (M4)
  *
- * M0 토대: 실제 알림(macOS 네이티브/Slack 등) 로직은 M1 이후에 구현.
- * 이 파일은 M1 파서 구현이 import 가능한 진입점 골격만 제공한다.
+ * VerdictRouter + CooldownStore + NotifyDispatcher + Sinks
  */
 
-/** 알림 채널 종류 */
-export type NotifyChannel = 'macos' | 'slack' | 'noop'
+export { buildNotificationPayload } from './build-notification-payload.js'
+export type { PayloadMeta } from './build-notification-payload.js'
 
-/** 알림 메시지 인터페이스 (M1에서 구체화) */
-export interface NotifyMessage {
-  readonly title: string
-  readonly body: string
-  readonly channel?: NotifyChannel
-}
+export { buildLowConfidencePayload, isJudgeErrorOrDeferred } from './build-low-confidence-payload.js'
+export type { LowConfidencePayloadMeta } from './build-low-confidence-payload.js'
 
-/** 알림 결과 인터페이스 (M1에서 구현) */
-export interface NotifyResult {
-  readonly success: boolean
-  readonly channel: NotifyChannel
-}
+export { routeVerdict, routeJudgeError, routeMetaEvent } from './verdict-router.js'
+export type { RouteDecision, SuppressedReason, DebounceState, GetDebounceState } from './verdict-router.js'
+
+export { CooldownStore, ensureNotificationsTable, NOTIFICATIONS_TABLE_DDL } from './cooldown-store.js'
+
+export { NotifyDispatcher } from './notify-dispatcher.js'
+export type { DispatchResult, DispatchLogger } from './notify-dispatcher.js'
+
+export { MetaNotifyOnce, metaNotifyOnce } from './meta-notify-once.js'
+export type { MetaNotifyOnceResult } from './meta-notify-once.js'
+
+export { MockNotifySink } from './sinks/mock-notify-sink.js'
+export type { SentRecord } from './sinks/mock-notify-sink.js'
+
+export { CliNotifySink } from './sinks/cli-notify-sink.js'
+export { WebhookNotifySink } from './sinks/webhook-notify-sink.js'
+export { DesktopNotifySink } from './sinks/desktop-notify-sink.js'
 
 /**
- * notify 모듈 기본 export.
- * M0에서는 스텁만 제공한다.
+ * 기본 export — 모듈 스텁 호환성 유지 (module-stubs.test.ts).
+ * M4 notify 모듈의 버전 정보를 담는다.
  */
-const notifyStub = {
-  version: '0.0.0-m0',
-  description: 'LoopBreaker notify stub — M1에서 구현 예정',
+const notifyModule = {
+  version: '0.4.0-m4',
+  description: 'LoopBreaker notify module — VerdictRouter + NotifyDispatcher + Sinks',
 } as const
 
-export default notifyStub
+export default notifyModule
