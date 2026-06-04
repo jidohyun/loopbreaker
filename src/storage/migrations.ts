@@ -10,6 +10,7 @@
 
 import type Database from 'better-sqlite3'
 import type { DbKind } from '../contracts.js'
+import { ensureNotificationsTable } from '../notify/cooldown-store.js'
 
 /** 단일 마이그레이션 정의 */
 export interface Migration {
@@ -324,8 +325,14 @@ export const MIGRATIONS: Migration[] = [
     kind: 'eval',
     up: createEvalInitialSchema,
   },
-  // 향후 마이그레이션:
-  // { version: 2, kind: 'op', up: (db) => { ... } },
+  // ---- M4 알림: notifications 테이블 (op DB version 2) ----
+  // CooldownStore가 디바운스/쿨다운 상태를 영속·워밍업하는 테이블.
+  // DDL 단일 출처는 cooldown-store.ts (ensureNotificationsTable).
+  {
+    version: 2,
+    kind: 'op',
+    up: (db) => ensureNotificationsTable(db),
+  },
 ]
 
 // ---- 마이그레이션 러너 ----
