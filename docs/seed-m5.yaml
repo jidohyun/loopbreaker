@@ -1,0 +1,103 @@
+goal: "LoopBreaker M5 마일스톤 — 데몬 통합. SPEC §2(아키텍처/런타임 데이터흐름)·§3.3(메인루프 의사코드)·§4(장애처리 9행)·§6(설정/핫리로드 분류)이 정본. M0~M4가 만든 부품(contracts·parser·orphan·tail-reader·event-store·structure-gate·m3-pipeline·embed/judge·verdict-router·notify-dispatcher·cooldown·migrations·watch-offsets)을 단일 Node 데몬의 메인루프로 조립한다. 흐름: lockfile(단일 인스턴스) → ConfigManager.load(zod, 중첩→평면 매핑) → StorageLayer.open〔WAL+busy_timeout+sqlite-vec+migrations〕 → ApiClients(DI) → SessionRegistry → WatchSource.start(onSessionAppear/Change/Remove) → 세션당 SessionPipeline(직렬 EventQueue: TailReader 증분read→parseLine→event-store 멱등적재→saveOffset 전진→queryEventsBySession→structuralGate→[M5 신규]hits→triples bridge→runM3Pipeline→DetectionRecord→VerdictRouter→NotifyDispatcher) → signal handlers(SIGTERM→gracefulShutdown) → config.onReload(핫리로드). 평가·검증 하니스(metrics/calibrate/replay/골드셋)는 M6으로 분리(사용자 확정). M0~M4 위에 쌓고 재정의하지 않는다. docs/SPEC.md가 SSOT."
+
+constraints:
+  - "⚠️ 테스트 부수효과 절대 금지(M3·M4 모킹 원칙 계승, M5의 최우선 계약): 데몬/통합/단위 테스트는 (1)파일감시=MockWatchSource(또는 InMemoryWatchSource: onSessionAppear/Change/Remove를 수동 트리거, chokidar 미사용) (2)API=Mock EmbedClient/Mock JudgeClient (3)알림=MockNotifySink (4)lockfile=임시경로(os.tmpdir 하위) (5)DB=임시경로 or in-memory(:memory:는 sqlite-vec/WAL 한계 시 tmpdir 파일) 로만 동작한다. 어떤 테스트도 실제 ~/.claude 감시·실제 네트워크 fetch·실제 OS 데스크톱 알림·실제 ~/.loopbreaker/daemon.lock·실제 API 키를 요구하거나 발생시키지 않는다. ralph는 실제 데몬을 launchd로 띄우거나 실제 알림을 쏘지 않는다."
+  - "⚠️ chokidar import 격리(M4 node-notifier 격리 정신 계승): chokidar에 의존하는 코드는 src/watch/chokidar-watch-source.ts(신규 어댑터) 내부로만 격리한다. 단 기존 src/watch/index.ts의 WatchManager/createWatcher/resolveWatchPath/isMacOS는 이미 chokidar v4 glob제거 대응·darwin 폴링자동·awaitWriteFinish가 검증돼 있으므로 재작성 금지 — ChokidarWatchSource 어댑터가 이들을 내부에서 재사용(감싸기)한다. 신규 WatchSource 인터페이스 파일(src/watch/watch-source.ts)에는 chokidar import가 0이어야 하고, daemon.ts·SessionRegistry·SessionPipeline은 WatchSource 인터페이스에만 의존(구체 chokidar 타입 노출 금지). 검증: grep 'from .chokidar.' 결과가 src/watch/chokidar-watch-source.ts 와 기존 src/watch/index.ts 두 파일에만 나타나야 한다."
+  - "⚠️ hits→triples 글루(M5 최대 위험, 코드베이스에 없는 부품 — 신규 작성 필수): runStructuralGateOverEvents(events, config)는 DetectionHit[]만 반환하고, runM3Pipeline(hits, triples, opts)는 hits와 동일 순서·길이의 (readonly ActionTriple[])[]를 요구하며 hits.length!==triples.length면 즉시 throw한다. 따라서 M5는 bridge 함수를 신규 작성한다. 확정 규칙(직접 검증함): 각 DetectionHit에 대해 hit.gate.windowRefs(이벤트 UUID 배열)로 해당 세션 이벤트들을 조회→buildTriple(storedEvent)로 ActionTriple 생성→null 제거→그 hit의 ActionTriple[]. StoredEvent는 NormalizedEvent를 extends하므로 buildTriple에 그대로 전달 가능(변환 불필요). hits를 순회해 같은 순서로 모으면 길이 계약 자동 충족. 빈 triple 배열이 나오면 그 hit는 runM3Pipeline에 그대로 넘기되(processHit의 buildEmbeddingPairs가 빈 입력을 어떻게 처리하는지 src/detect/semantic-stage.ts buildEmbeddingPairs를 먼저 읽고 안전한지 확인), 만약 빈 입력이 위험하면 해당 hit를 bridge 단계에서 제외(hits/triples 둘 다에서 동시 제외해 길이 일치 유지)한다. 이 bridge는 detect 영역 함수(buildTriple)를 호출만 하고 탐지 알고리즘을 재정의하지 않는다."
+  - "⚠️ config 중첩→평면 매핑(신규 어댑터 필수): loadConfig(configPath?)는 중첩 LoopBreakerConfig{version, detector, privacy, api, watch, webhook, notify}를 반환하지만, 파이프라인(structuralGate·runM3Pipeline·VerdictRouter·NotifyDispatcher)은 평면 DetectorConfig(contracts.ts)를 먹는다. M5는 LoopBreakerConfig→DetectorConfig 매핑 어댑터를 ConfigManager 안에 신규 작성한다. 매핑 시 DEFAULT_DETECTOR_CONFIG의 어떤 기본값도 변경하지 않으며(평면 기본값 동결), config 파일에 명시된 안전필드만 덮어쓴다. config 파일이 없으면 loadConfig가 zod 기본값을 반환한다."
+  - "재사용(재정의·수정 절대 금지, import만): contracts.ts(NormalizedEvent/ActionTriple/StructureGateResult/DetectionHit/DetectionRecord/DetectionVerdict{kind:'thrashing'|'false_success'|'none'}/EmbeddingSimilarityResult{pairs}/JudgeVerdict/NotificationPayload/NotifySink/DetectorConfig/DEFAULT_DETECTOR_CONFIG), ingest(parseChunk/parseLine, TailReader(.start/.close/.byteOffset/.partialLine/.updateOffset), insertParsedLines(멱등), queryEventsBySession, orphan-buffer), detect(runStructuralGateOverEvents/detectThrashingForSession/DetectionHit, buildTriple, runM3Pipeline/M3PipelineOptions{embedClient,judgeClient,config}, semantic-stage buildEmbeddingPairs), api(EmbedClient/JudgeClient 인터페이스 + Mock 구현, RealEmbedClient/AnthropicJudgeClient는 NotImplemented throw 스텁), notify(VerdictRouter.route(verdict,config,ctx), NotifyDispatcher(sinks,cooldown,config,logger?).dispatch(record,sessionId,now?)/.dispatchMeta(sessionId,reason,now?), CooldownStore(db).warmUp(), 4종 NotifySink), config(loadConfig/defaultConfigDir/defaultConfigPath/loopBreakerConfigSchema), storage(runMigrations(db,kind,appVersion,embedDim)/getSchemaVersion/MIGRATIONS, loadSqliteVec(db), readOffsets/saveOffset(db,filePath[,byteOffset])), watch(기존 WatchManager/createWatcher 재사용). ESM이므로 import 시 '.js' 확장자 사용."
+  - "사용자 결정 반영: StorageLayer는 신규 클래스로 작성한다. open〔opPath, evalPath?, opts〕 메서드 호출 시 better-sqlite3로 DB를 열고, op DB는 loadSqliteVec(db)를 오픈 직후 호출한 뒤 runMigrations(db,'op',appVersion,embedDim)을 적용한다. PRAGMA journal_mode=WAL, synchronous=NORMAL, foreign_keys=ON, busy_timeout(SPEC §1-0 권고값 5000ms), temp_store=MEMORY를 모든 연결에 적용한다(migrate-cli.ts 패턴 참조). 모든 쓰기는 단일 writer 직렬 큐(세션 간 write 순서 보존)를 통과한다. close()는 큐 drain 후 DB를 닫는다. detections/events 멱등 업서트는 기존 insertParsedLines·event-store를 재사용한다. lastByteOffset(watch-offsets) 전진은 해당 라인이 영속화(insertParsedLines)까지 성공한 뒤에만(saveOffset) 일어난다 — at-least-once(SPEC §2.2(2))."
+  - "사용자 결정 반영: SessionPipeline은 세션당 1 인스턴스, concurrency=1 직렬 EventQueue를 갖는다(SPEC §3.1 '세션별 직렬 큐'). maxQueueDepth 기본 1000(SPEC §3.2), 초과 시 COALESCE — 중복 'change' 신호는 합쳐 1개로 처리(이미 대기 중이면 enqueue skip), 실제 라인은 TailReader가 EOF까지 한 번에 흡수하므로 라인 폭주는 한 번의 큰 read로 흡수. enqueue('change')는 TailReader 증분 read→parseLine→insertParsedLines→saveOffset→queryEventsBySession→gate→bridge→runM3Pipeline→dispatch를 직렬로 수행한다. 세션 격리: 한 세션 파이프라인의 예외가 다른 세션·데몬 전체를 죽이지 않는다."
+  - "사용자 결정 반영: SessionRegistry는 sessionId→SessionPipeline lazy 맵이다. ensurePipeline(sid, filePath, deps{storage,api,detectorConfig,dispatcher}) 시 없으면 생성, 있으면 재사용. pipeline(sid).enqueue('change'), pipeline(sid).drainAndClose()(세션 파일 unlink 시). WatchSource 콜백(onSessionAppear→ensurePipeline, onSessionChange→enqueue, onSessionRemove→drainAndClose)을 SessionRegistry에 배선한다. sessionId는 파일경로에서 도출(기존 parser/event-store가 sessionId를 채우는 방식과 일치하게 — source_file/session_id 매핑 확인)."
+  - "장애처리(SPEC §4, 침묵실패 금지): (a)per-line try/catch — JSON.parse 실패·unknown record type은 drop이 아니라 skip+카운트(skippedUnknownCount), 파이프라인 계속. (b)세션 격리 — 한 세션 파이프라인 throw가 다른 세션/데몬을 안 죽임. (c)SQLITE_BUSY → WAL+busy_timeout으로 흡수, write 실패는 큐에서 제한 재시도. (d)embed/judge API 실패는 runM3Pipeline이 이미 fail-closed로 해당 hit 미발화 처리(M3 계승) — M5는 이 예외가 세션 파이프라인을 죽이지 않게 감싼다. (e)부분 라인(종결 개행 없음)은 TailReader.partialLine에 보관, byteOffset은 마지막 완결 라인까지만 전진(saveOffset). (f)모든 degrade는 구조화 로그/카운터로 가시화 — console.log 금지, 주입된 logger 또는 구조화 이벤트 사용."
+  - "핫리로드(SPEC §6.1 분류 정본): ConfigManager.onReload는 config 파일 변경 감시(기존 createWatcher 재사용 또는 fs.watch — 단 chokidar 직접 import는 어댑터 격리 규칙 위반이므로 watch-source 추상화 또는 fs.watchFile 사용) → 재검증(zod) → 안전필드만 무중단 적용, 위험필드는 적용거부+경고로그. 안전필드(무중단)=임계값(WARNING/CRITICAL/errLoop*/fileEdit*/simThresh/decideThresh/selfApproval*)·notifyDebounceMs·notifyChannels·webhookUrl·lowConfidenceNotify·privacy·api상한(maxConcurrentApiCalls/apiMaxRetries/dailyCostCapUsd/maxJudgeCallsPerSession). 위험필드(재기동요구, 적용거부)=DB경로·watch.sessionGlob·embedDim·embedModelId·judgeModelId. 재검증 실패 시 이전 유효 설정 유지(데몬 안 죽임)."
+  - "gracefulShutdown(SPEC §3.3 installSignalHandlers, shutdown.ts 신규): SIGTERM/SIGINT 수신 시 (1)WatchSource.close()로 신규 이벤트 enqueue 중단 (2)각 SessionPipeline의 큐 drain(진행 중 작업 완료까지 대기) (3)StorageLayer flush/close (4)lockfile 해제. 종료는 순서 보장. 강제 종료 타임아웃(예: shutdownTimeoutMs) 초과 시 최선 노력으로 close."
+  - "lockfile.ts(신규, SPEC §3.1): flock 또는 PID 기반 단일 인스턴스 보증. acquireLock(lockPath) — 이미 점유 시 throw(또는 false 반환 후 데몬 기동 거부). releaseLock(). lockPath는 DI(기본 ~/.loopbreaker/daemon.lock, 테스트는 os.tmpdir 하위 임시경로). 프로세스 비정상 종료 후 stale lock 처리(PID 살아있는지 확인) 고려."
+  - "ApiClients(신규 팩토리, src/api/api-clients.ts 또는 동등): config의 embedModelId/judgeModelId/API키 유무로 EmbedClient/JudgeClient 구현을 선택한다 — 키가 있고 Real 구현이 가능하면 Real, 아니면(테스트·키없음) Mock. M5 테스트는 항상 Mock을 DI로 주입. RealEmbedClient/AnthropicJudgeClient는 현재 NotImplemented throw 스텁이므로, 팩토리는 키 부재 시 Mock으로 폴백하거나 명확한 에러를 던진다(데몬 기동 거부 + doctor 안내). M5 범위에서 Real 구현 본체를 채울 필요는 없음(M3가 인터페이스+Mock으로 확정) — 팩토리 조립과 DI 경로만 완성."
+  - "Node.js >= 20, TypeScript ESM strict. 작은 파일(200~400줄, 800 최대). 불변성(no mutation, 새 객체 생성). zod 검증. console.log 금지(주입 logger/구조화 이벤트). 새 npm 의존성 추가 금지가 원칙이나 단일 인스턴스용 proper-lockfile 등이 꼭 필요하면 추가 가능(추가 시 package.json 반영). 기존 deps(better-sqlite3/chokidar/sqlite-vec/node-notifier/zod)로 충분한지 우선 검토."
+  - "통합 글루 명시(M1~M4 교훈, AC로 강제): MockWatchSource로 세션 파일 1개의 라인 추가를 시뮬레이션 → daemon(또는 조립된 메인루프)이 TailReader→parse→적재→gate→bridge→runM3Pipeline(Mock embed/judge)→DetectionRecord→VerdictRouter→NotifyDispatcher(MockNotifySink)까지 end-to-end로 흐르고, 고신뢰 thrashing/false_success 케이스에서 MockNotifySink에 알림 1건이 기록돼야 한다(실제 OS알림·네트워크 0). kind='none'/저신뢰/디바운스 케이스는 미발송. 이 end-to-end 통합 테스트가 반드시 존재해야 한다."
+  - "불변 기준선 동결: DEFAULT_DETECTOR_CONFIG의 모든 값(WARNING=10 CRITICAL=20 circuitBreaker=30 historySize=30 errLoopWarn=3 errLoopCrit=5 fileEditWarn=5 fileEditCrit=8 simThresh=0.90 decideThresh=0.7 selfApprovalMs=15000 selfApprovalCriticalMs=1000 judgeSelfConsistencyN=1 judgePositionSwaps=0 embedModelId='voyage-3-lite' judgeModelId='claude-3-5-sonnet-20241022' embedDim=1024 notifyDebounceMs=60000 notifyChannels=['desktop','cli'] webhookUrl=undefined lowConfidenceNotify=false) 변경 금지. op DB 최신 마이그레이션=v2, eval DB=v1 — MIGRATIONS는 append-only(기존 항목 수정/삭제 금지). M5가 op/eval DB에 새 테이블이 꼭 필요하면 새 버전 append만 하고, op 버전이 올라가면 migrations 관련 테스트 기대값을 갱신한다. M0~M4 기존 테스트 회귀 0(시작 직전 npm test 실측치를 기준선으로 동결, 감소·skip 금지)."
+
+acceptance_criteria:
+  - "src/daemon/lockfile.ts가 단일 인스턴스 lock을 제공한다(acquireLock/releaseLock, lockPath DI). 이미 점유된 lock 획득 시도는 거부되고, 테스트는 임시경로 lock으로 동작한다(실제 ~/.loopbreaker/daemon.lock 미사용)."
+  - "src/watch/watch-source.ts에 chokidar import 0인 WatchSource 인터페이스(onSessionAppear/onSessionChange/onSessionRemove 콜백 등록 + start()/close())가 정의된다. src/watch/chokidar-watch-source.ts가 기존 WatchManager/createWatcher를 내부 재사용해 chokidar add/change/unlink 이벤트를 WatchSource 콜백으로 어댑팅한다(chokidar import는 이 파일에만). src/watch/mock-watch-source.ts(또는 InMemoryWatchSource)가 chokidar 없이 콜백을 수동 트리거한다."
+  - "src/daemon/session-pipeline.ts의 SessionPipeline이 세션당 concurrency=1 직렬 EventQueue를 갖고, enqueue('change') 시 TailReader 증분read→parseLine→insertParsedLines(멱등)→saveOffset(영속 성공 후 전진)→queryEventsBySession→runStructuralGateOverEvents→[bridge]→runM3Pipeline→NotifyDispatcher.dispatch를 직렬 수행한다. maxQueueDepth(기본 1000) 초과 시 COALESCE. 한 라인/세션 예외가 파이프라인 전체를 죽이지 않는다(per-line try/catch + skippedUnknownCount)."
+  - "hits→triples bridge가 신규 작성된다(예: src/daemon/session-pipeline.ts 내부 또는 src/detect/hits-to-triples.ts): 각 DetectionHit의 gate.windowRefs UUID들로 events를 조회→buildTriple(storedEvent)→null 제거→그 hit의 ActionTriple[]. 결과 (ActionTriple[])[]는 hits와 동일 순서·길이여서 runM3Pipeline이 throw하지 않는다. 빈 triple 처리는 buildEmbeddingPairs 안전성 확인 후 결정(위험하면 hit·triple 동시 제외로 길이 일치 유지). bridge 단위 테스트가 길이 일치·windowRefs→triple 매핑·빈 입력 케이스를 검증한다."
+  - "src/config/config-manager.ts의 ConfigManager가 loadConfig() 중첩 LoopBreakerConfig를 평면 DetectorConfig로 매핑하는 toDetectorConfig 어댑터를 제공하고(DEFAULT_DETECTOR_CONFIG 기본값 불변), onReload(next)로 핫리로드를 수행한다 — 안전필드(임계값/디바운스/notifyChannels/webhookUrl/lowConfidenceNotify/privacy/api상한)는 무중단 적용, 위험필드(DB경로/sessionGlob/embedDim/embedModelId/judgeModelId)는 적용거부+경고. 재검증(zod) 실패 시 이전 설정 유지. 단위 테스트가 안전필드 적용·위험필드 거부·검증실패 폴백을 검증한다."
+  - "src/storage/storage-layer.ts의 StorageLayer가 open〔WAL+synchronous=NORMAL+foreign_keys=ON+busy_timeout 5000+temp_store=MEMORY, op DB는 loadSqliteVec 후 runMigrations 'op'〕·단일 writer 직렬 큐·close(drain 후 닫기)를 제공한다. ops/eval 핸들 분리. 멱등 적재는 insertParsedLines/event-store 재사용, 오프셋 전진은 saveOffset이 적재 성공 후에만. 테스트는 임시경로/in-memory DB로 동작."
+  - "src/api/api-clients.ts(또는 동등)의 ApiClients 팩토리가 config 모델ID/키로 Embed/Judge 클라이언트를 선택 조립한다(키 없거나 Real 스텁이면 Mock 폴백 또는 명확한 기동거부 에러). 데몬/통합 테스트는 Mock을 DI 주입. RealEmbedClient/AnthropicJudgeClient 본체 구현은 M5 범위 아님(NotImplemented 스텁 유지 허용)."
+  - "src/daemon/shutdown.ts의 gracefulShutdown이 WatchSource.close→세션 큐 drain→StorageLayer flush/close→lockfile 해제 순서로 graceful 종료하고, shutdownTimeoutMs 초과 시 최선 노력 close. 단위 테스트가 종료 순서와 drain 보장을 MockWatchSource/임시 DB로 검증."
+  - "src/watch/session-registry.ts의 SessionRegistry가 sessionId→SessionPipeline lazy 맵을 제공하고(ensurePipeline/pipeline/drainAndClose), WatchSource 콜백(appear→ensure, change→enqueue, remove→drainAndClose)을 배선한다. sessionId 도출이 기존 parser/event-store의 session_id/source_file 매핑과 일치한다."
+  - "src/daemon/daemon.ts가 SPEC §3.3 메인루프를 조립한다: lockfile→ConfigManager.load(매핑)→StorageLayer.open→ApiClients(DI)→SessionRegistry→WatchSource.start(콜백 배선)→installSignalHandlers(SIGTERM→gracefulShutdown)→config.onReload. 외부 의존(WatchSource/ApiClients/StorageLayer/NotifySink/lockPath)은 전부 DI여서 테스트가 Mock/임시경로로 데몬을 기동·정지할 수 있다. 데몬은 --foreground 직접 실행 경로를 가진다(launchd 없이 디버그)."
+  - "통합 end-to-end 테스트: MockWatchSource로 세션 파일 1개에 thrashing 유발 라인들 추가 시뮬레이션 → 조립된 데몬/메인루프가 적재→gate→bridge→runM3Pipeline(Mock embed/judge)→DetectionRecord→VerdictRouter→NotifyDispatcher(MockNotifySink)까지 흘러 MockNotifySink에 고신뢰 알림 1건 기록. kind='none'/저신뢰/디바운스 입력은 미발송. 실제 fs.watch·네트워크·OS알림 0. 데몬 stop()이 graceful drain 후 종료."
+  - "부수효과 격리 검증: grep 결과 chokidar import는 src/watch/chokidar-watch-source.ts와 기존 src/watch/index.ts에만, node-notifier는 DesktopNotifySink 내부에만 존재. 모든 테스트가 Mock(WatchSource/Embed/Judge/NotifySink)·임시경로 lock·임시/in-memory DB로 동작하며 실제 API키·네트워크·OS알림·~/.loopbreaker·~/.claude 감시를 요구하지 않는다."
+  - "npm run typecheck가 에러 없이 통과한다(tsc --noEmit 0 에러)."
+  - "npm test가 통과한다 — M0~M4 기존 테스트 회귀 0(시작 직전 실측한 기준선 통과 수 이상, 감소·skip 없음) + M5 신규 단위/통합 테스트 통과. 커버리지 목표 80%(jest threshold 60 하회 금지). 모든 테스트 MockWatchSource·Mock API·MockNotifySink·임시경로로 부수효과 없이 결정론 동작."
+
+ontology_schema:
+  name: LoopBreakerM5
+  description: "M5 데몬 통합이 다루는 런타임 조립 — 파일 변경 신호에서 근거 동반 알림까지를 단일 데몬 메인루프로 잇는 부품과 경계"
+  fields:
+    - name: Daemon
+      type: object
+      description: "SPEC §3.3 메인루프. lockfile→config(매핑)→storage→api→registry→watch→signal→onReload를 DI로 조립한 단일 프로세스. start()/stop(). 모든 외부 의존 주입 가능"
+      required: true
+    - name: WatchSource
+      type: object
+      description: "파일 감시 추상화(chokidar 미노출). onSessionAppear/onSessionChange/onSessionRemove + start/close. Chokidar(실구현, 기존 WatchManager 재사용)/Mock(테스트, 수동 트리거) 구현. 테스트는 Mock만"
+      required: true
+    - name: SessionPipeline
+      type: object
+      description: "세션당 1 인스턴스, concurrency=1 직렬 EventQueue. enqueue('change')가 tail→parse→적재→offset전진→gate→bridge→m3→dispatch를 직렬 수행. maxQueueDepth COALESCE, 세션 격리"
+      required: true
+    - name: HitsToTriplesBridge
+      type: object
+      description: "M5 신규 글루. DetectionHit.gate.windowRefs(UUID[])→events 조회→buildTriple→null 제거→hit별 ActionTriple[]. runM3Pipeline 길이 계약(hits.length===triples.length) 충족"
+      required: true
+    - name: StorageLayer
+      type: object
+      description: "신규. better-sqlite3 op/eval 핸들, WAL+busy_timeout+sqlite-vec+migrations, 단일 writer 직렬 큐. 멱등 적재·오프셋 전진은 기존 event-store/watch-offsets 재사용"
+      required: true
+    - name: ConfigManager
+      type: object
+      description: "중첩 LoopBreakerConfig→평면 DetectorConfig 매핑 어댑터 + 핫리로드(onReload). 안전필드 무중단/위험필드 거부(SPEC §6.1). DEFAULT_DETECTOR_CONFIG 불변"
+      required: true
+    - name: DetectionRecord
+      type: object
+      description: "M3 정본(읽기전용 소비). runM3Pipeline 산출. SessionPipeline이 NotifyDispatcher로 흘려보냄. 재정의 금지"
+      required: false
+
+evaluation_principles:
+  - name: no_side_effects_in_tests
+    description: "M5 최우선 계약. 모든 테스트가 MockWatchSource(chokidar 0)+Mock Embed/Judge+MockNotifySink+임시경로 lock+임시/in-memory DB로 결정론 동작. 실제 fs.watch·네트워크·OS알림·~/.loopbreaker·~/.claude·API키 요구 0. chokidar import는 어댑터+기존 index.ts에만 격리. ralph가 실제 데몬/알림 안 띄움"
+    weight: 0.25
+  - name: daemon_integration
+    description: "SPEC §3.3 메인루프 조립 정확성 — lockfile→config(매핑)→storage(WAL+vec+migrations)→api(DI)→registry→watch(콜백 배선)→signal(graceful)→onReload가 실제로 이어지고, 모든 외부 의존이 DI여서 Mock/임시경로로 데몬을 기동·정지할 수 있음. end-to-end 통합 테스트로 검증"
+    weight: 0.30
+  - name: glue_bridges
+    description: "hits→triples bridge(windowRefs→buildTriple, 길이계약 충족, 빈입력 안전) + config 중첩→평면 매핑(기본값 불변) — M5 고유의 두 위험 글루가 정확하고 테스트됨"
+    weight: 0.15
+  - name: reuse_and_invariants
+    description: "M0~M4 재사용(contracts/ingest/detect/notify/api/config/storage/WatchManager 재정의 0) + DEFAULT_DETECTOR_CONFIG·op v2/eval v1 동결 + MIGRATIONS append-only + 회귀 0(기준선 통과 수 유지)"
+    weight: 0.15
+  - name: failure_handling
+    description: "SPEC §4 — per-line try/catch+세션 격리(한 라인/세션 장애가 데몬 전체 안 죽임), unknown skip+카운트, SQLITE_BUSY는 WAL+busy_timeout, API실패 fail-closed(M3 계승)가 파이프라인 안 죽임, gracefulShutdown drain 순서, 침묵실패 금지(구조화 로그)"
+    weight: 0.10
+  - name: hot_reload_and_config
+    description: "핫리로드(SPEC §6.1) 안전필드 무중단/위험필드 거부+경고/재검증 실패 폴백, zod 검증, 매핑 어댑터가 DEFAULT_DETECTOR_CONFIG 불변 유지"
+    weight: 0.05
+
+exit_conditions:
+  - name: acceptance_met
+    description: "모든 acceptance_criteria 충족"
+    criteria: "npm run typecheck(0 에러)와 npm test(기준선 회귀 0 + M5 신규 통과, 전부 Mock/임시경로/부수효과 0)가 통과하고, MockWatchSource로 세션 라인 추가 → gate→bridge→runM3Pipeline(Mock)→DetectionRecord→dispatcher→MockNotifySink 알림 1건이 end-to-end 통합 테스트로 검증되며, kind='none'/저신뢰/디바운스는 미발송, 데몬 stop()이 graceful drain 후 종료됨"
+  - name: m6_ready
+    description: "M6(평가·검증 하니스 + 골드셋, SPEC §6, src/eval/: metrics/calibrate/replay/report + 골드셋 구축)을 바로 시작할 수 있는 상태"
+    criteria: "데몬 메인루프가 완성되어 실세션 흐름이 동작하고, StorageLayer가 op/eval DB를 모두 열어 두며 eval.db가 비어 있더라도 평가 하니스가 골드셋·metrics·캘리브레이션·리플레이를 붙일 수 있도록 eval 핸들과 DetectionRecord 영속이 마련돼 있음(eval DB 스키마가 추가로 필요하면 M5가 eval v2 마이그레이션을 append했거나, M6이 append할 수 있게 MIGRATIONS append-only 규칙이 보존됨)"
+
+metadata:
+  project: LoopBreaker
+  milestone: M5
+  spec_ref: docs/SPEC.md
+  builds_on: M4 (commit 04262e8)
+  ambiguity_score: 0.15
