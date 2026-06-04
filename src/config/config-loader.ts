@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { loopBreakerConfigSchema, type LoopBreakerConfig } from './config-schema.js'
+import { DEFAULT_DETECTOR_CONFIG, type DetectorConfig } from '../contracts.js'
 
 /** 기본 설정 디렉터리 (~/.loopbreaker) */
 export function defaultConfigDir(): string {
@@ -71,4 +72,72 @@ export function loadConfig(configPath: string = defaultConfigPath()): LoopBreake
   }
 
   return Object.freeze(result.data)
+}
+
+/**
+ * 중첩 LoopBreakerConfig를 평면 DetectorConfig로 변환하는 어댑터.
+ *
+ * 매핑 규칙 (SPEC §6.1, BLOCKER C3):
+ *   - config.detector.* → DetectorConfig 구조 게이트 임계값 / 모델 설정 / 의미 게이트 임계값
+ *   - config.notify.notifyDebounceMs → DetectorConfig.notifyDebounceMs
+ *   - config.detector.notifyChannels → DetectorConfig.notifyChannels
+ *   - config.detector.webhookUrl → DetectorConfig.webhookUrl
+ *   - config.detector.lowConfidenceNotify → DetectorConfig.lowConfidenceNotify
+ *
+ * 안전 원칙:
+ *   - DEFAULT_DETECTOR_CONFIG의 모든 기본값을 변경하지 않는다.
+ *   - config 파일에 명시된 안전 필드만 덮어쓴다.
+ *   - 반환 객체는 새 객체로 생성 (불변성, 원본 config 미변경).
+ *
+ * @param config loadConfig()가 반환한 검증된 LoopBreakerConfig
+ * @returns 평면화된 DetectorConfig (DEFAULT_DETECTOR_CONFIG 기반, config로 오버라이드)
+ */
+export function toDetectorConfig(config: LoopBreakerConfig): DetectorConfig {
+  const d = config.detector
+  const n = config.notify
+
+  // DEFAULT_DETECTOR_CONFIG를 기반으로 명시된 필드만 덮어쓴다.
+  // notifyDebounceMs는 config.notify.notifyDebounceMs에서 매핑한다
+  // (config.detector에도 notifyDebounceMs가 있으면 detector 값 우선).
+  const notifyDebounceMs =
+    d.notifyDebounceMs !== DEFAULT_DETECTOR_CONFIG.notifyDebounceMs
+      ? d.notifyDebounceMs
+      : n.notifyDebounceMs !== DEFAULT_DETECTOR_CONFIG.notifyDebounceMs
+        ? n.notifyDebounceMs
+        : DEFAULT_DETECTOR_CONFIG.notifyDebounceMs
+
+  return {
+    // ---- 구조 게이트 임계값 (config.detector → flat) ----
+    WARNING: d.WARNING,
+    CRITICAL: d.CRITICAL,
+    circuitBreaker: d.circuitBreaker,
+    historySize: d.historySize,
+    errLoopWarn: d.errLoopWarn,
+    errLoopCrit: d.errLoopCrit,
+    fileEditWarn: d.fileEditWarn,
+    fileEditCrit: d.fileEditCrit,
+
+    // ---- 의미 게이트 임계값 (config.detector → flat) ----
+    simThresh: d.simThresh,
+    decideThresh: d.decideThresh,
+
+    // ---- 가짜성공 프로브 임계값 (config.detector → flat) ----
+    selfApprovalMs: d.selfApprovalMs,
+    selfApprovalCriticalMs: d.selfApprovalCriticalMs,
+
+    // ---- judge 설정 (config.detector → flat) ----
+    judgeSelfConsistencyN: d.judgeSelfConsistencyN,
+    judgePositionSwaps: d.judgePositionSwaps,
+
+    // ---- 모델 설정 (config.detector → flat, 위험필드) ----
+    embedModelId: d.embedModelId,
+    judgeModelId: d.judgeModelId,
+    embedDim: d.embedDim,
+
+    // ---- 알림 설정 (config.detector + config.notify → flat) ----
+    notifyDebounceMs,
+    notifyChannels: d.notifyChannels,
+    webhookUrl: d.webhookUrl,
+    lowConfidenceNotify: d.lowConfidenceNotify,
+  }
 }

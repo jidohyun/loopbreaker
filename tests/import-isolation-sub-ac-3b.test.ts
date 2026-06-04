@@ -83,9 +83,12 @@ const allSrcFiles = collectTsFiles(SRC_DIR)
 /**
  * Files that are ALLOWED to reference real-embed-client:
  *   - The stub file itself (it IS real-embed-client)
+ *   - The ApiClients factory (api-clients.ts) — conditionally returns Real stubs via DI;
+ *     the factory is the single gating point; all tests inject Mock via opts.embedClient/mock.
  */
 const ALLOWED_REFERENCING_FILES = new Set([
   join(SRC_DIR, 'api', 'real-embed-client.ts'),
+  join(SRC_DIR, 'api', 'api-clients.ts'),
 ])
 
 /** src/ files that must not import real-embed-client */

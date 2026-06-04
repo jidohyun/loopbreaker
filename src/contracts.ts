@@ -488,7 +488,7 @@ export type DbKind = 'op' | 'eval'
  * SPEC §1 주석 기준. embedDim은 config.json에서 설정.
  * BLOCKER B2: embedModelId/judgeModelId는 예시값이며 실제는 config.json에서 지정.
  */
-export const DEFAULT_DETECTOR_CONFIG: DetectorConfig = {
+export const DEFAULT_DETECTOR_CONFIG: Readonly<DetectorConfig> = Object.freeze({
   WARNING: 10,
   CRITICAL: 20,
   circuitBreaker: 30,
@@ -510,7 +510,8 @@ export const DEFAULT_DETECTOR_CONFIG: DetectorConfig = {
   embedDim: 1024,
   // M4 알림 기본값
   notifyDebounceMs: 60000,
-  notifyChannels: ['desktop', 'cli'] as ('desktop' | 'webhook' | 'cli')[],
+  // Object.freeze로 배열도 불변 동결 (런타임 보호). 타입 호환을 위해 cast.
+  notifyChannels: Object.freeze(['desktop', 'cli']) as unknown as ('desktop' | 'webhook' | 'cli')[],
   webhookUrl: undefined,
   lowConfidenceNotify: false,
-} as const
+} satisfies DetectorConfig)
