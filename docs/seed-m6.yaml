@@ -1,0 +1,98 @@
+goal: "LoopBreaker M6 마일스톤 — 평가·검증 하니스 + 골드셋. SPEC §6(평가) + 데이터모델 DDL(gold_labels/eval_metrics/mock_cache, detections.is_replay) + contracts §5(평가/리플레이) + §1-1 정합화 C8/C9가 정본. M0~M5가 만든 부품(parser·orderEvents·event-store·structure-gate·hits-to-triples·m3-pipeline·embed/judge Mock·StorageLayer·migrations)을 배치 모드로 호출만 해서 평가 하니스를 만든다. 흐름: (1)후보추출(mineCandidates 구조신호만, judge 0)+dohyun 5건 합성시드+라벨링(label-cli) → gold_labels 적재 → (2)메트릭(computeMetrics: 혼동행렬→precision/recall/f1/macroF1/cohenKappa/balancedAccuracy + Wilson CI, thrashing=IoU span매칭, false_success=anchor±k, 클래스당 양성<15→정성폴백) → (3)캘리브레이션(calibrate: CalibrationGrid 격자탐색, k-fold, DEFAULT_DETECTOR_CONFIG copy+override) → (4)리플레이(replaySession: 녹화 JSONL→동일 파이프라인 재구동, eval DB 기록, dispatcher 스킵) → (5)리포트(renderReportMd/Json, SPEC §8 한계 인용). ⚠️ 골드셋 마이닝 부수효과(실 ~/.claude·dohyun 원본·개인정보·실파일·실API)는 전부 테스트 밖 — 테스트는 합성/픽스처 골드셋·Mock·임시경로만, 실 마이닝은 별도 수동 CLI(mine-real-sessions.ts)로 격리. M0~M5 위에 쌓고 재정의하지 않는다. docs/SPEC.md가 SSOT."
+
+constraints:
+  - "⚠️ 골드셋 부수효과 절대 격리(M6 최우선 계약, M3·M5 모킹 원칙 계승): 골드셋 마이닝은 본질적으로 실 ~/.claude/** 세션 읽기·dohyun 원본(evidence-model.md/.dohyun/logs) 접근·개인정보 텍스트·실 API 호출을 수반한다. 이를 테스트 안/밖 이중경계로 격리한다. 테스트 안(ralph 자동화, 부수효과 0): tests/fixtures/synthetic-sessions/*.jsonl(합성, 고정 시드) + seed-dohyun.ts(합성 dohyun_adapted gold_label row, 원본 미접근) + MockEmbedClient/MockJudgeClient(mock_cache) + 임시 eval DB(os.tmpdir 또는 ':memory:'). 테스트 밖(수동, ralph 실행 금지): src/eval/cli/mine-real-sessions.ts(실 ~/.claude 마이닝, 파일 헤더에 'MANUAL-ONLY: NOT a test target' 명시). 검증: src/eval 테스트에 '~/.claude'·'~/.dohyun'·'~/Desktop' 실경로 리터럴이 등장하면 안 됨(실경로는 인자/env 주입만)."
+  - "⚠️ 모킹 절대(M3·M5 계승): 평가 배치·replay·calibrate 전부 MockEmbedClient(entries,dim)/MockJudgeClient(entries)로만 동작. 응답은 mock_cache(eval DB)에서 sha256(input)+':'+modelId 키로 조회. 캐시 미스=테스트 실패(조용한 폴백/실API 금지). record 모드(실API+캐시 저장)는 수동 단계 전용. @anthropic-ai/sdk 미설치 상태 유지(M3 확정) — 실API 물리적 차단."
+  - "⚠️ dohyun 원본 미접근: seed-dohyun.ts는 evidence-model.md/git 히스토리를 읽지 않는다. 자기승인우회 5건(2건 Δ≈0s 자기승인, 3건 순환참조)을 하드코딩된 합성 윈도우로 표현 → source='dohyun_adapted', expected_signal='false_success', labeler_id='seed'. 원본 복원은 수동 단계에서만."
+  - "⚠️ 정량 메트릭 규칙: precision/recall/f1(클래스별)+macroF1+microF1+cohenKappa(Cohen's κ)+balancedAccuracy 산출, accuracy는 부록만(클래스 불균형). 각 클래스 Wilson 95% CI(z=1.96) 동반. 탐지 미발화(구조게이트 미통과)는 predByAnchor.get(uuid) ?? 'none'(none 예측 간주). 클래스당 양성<15(minSupport 기본 15)면 F1/κ 생략→perClass.skipped=true+skippedReason, 정성분석+CI만 리포트(SPEC: 양성<15 정성 폴백)."
+  - "매칭 규칙(SPEC §5 정본): gold↔pred를 anchorUuid join(latestPerAnchor로 supersedes 반영). thrashing=IoU span 매칭 — pred 윈도(gate.windowRefs 이벤트집합) ∩ gold span(start_uuid~end_uuid) / ∪, IoU>=0.5(τ=0.5 확정)→TP. false_success=anchor±k 매칭 — |pred.anchorUuid 위치 − gold.anchorUuid 위치|<=5(k=5 이벤트 확정), 동일세션 내, ±k 윈도 최고 confidence와 매칭. 세션 경계 넘는 매칭은 cross_session 플래그로 제외."
+  - "calibrate 격자탐색: grid=CalibrationGrid(contracts 기존 {candidates: Partial<DetectorConfig>[]} 재사용). stratified k-fold(k=5, 클래스비율 유지), 각 candidate config로 hold-out replay→computeMetrics, objective=macroF1 − λ·FPR_none(λ=0.5 기본 오탐페널티), end-to-end 채점(단계 독립평가 금지). 선택 config=DEFAULT_DETECTOR_CONFIG copy+override(원본 동결). nested CV는 골드셋 작으면(클래스당<30) grid 2~3점 축소+qualitativeFallback=true 정성폴백."
+  - "replay(SPEC f: live=replay 동일 경로): 녹화 JSONL→DetectionRecord[]를 §재사용시퀀스대로 직접 조립한다 — parseLine→insertParsedLines(멱등)→queryEventsBySession→runStructuralGateOverEvents→makeEventLookupFromArray→hitsToTriples→runM3Pipeline(Mock embed/judge). ⚠️ dispatcher.dispatch(알림 발송)는 호출 금지 — 평가는 메트릭만 산출, 알림 안 쏨. recordIsReplay=true면 detections.is_replay=1 기록. ReplayEvent=NormalizedEvent(동일 정렬기 ts→parentUuid위상→byteOffset)."
+  - "재사용(재정의·수정 절대 금지, import만): contracts.ts(DetectionRecord/DetectionVerdict{kind:'thrashing'|'false_success'|'none'}/NormalizedEvent/StoredEvent/DetectorConfig/DEFAULT_DETECTOR_CONFIG/CalibrationGrid{candidates:Partial<DetectorConfig>[]}/ActionTriple/StructureGateResult/JudgeVerdict), ingest(parseLine/orderEvents, insertParsedLines/queryEventsBySession, orphan-buffer sortByTimestamp), detect(runStructuralGateOverEvents/DetectionHit, hitsToTriples/makeEventLookupFromArray/EventLookup, runM3Pipeline/M3PipelineOptions, buildTriple), api(MockEmbedClient/MockJudgeClient + EmbedClient/JudgeClient 인터페이스), storage(StorageLayer.evalDb getter/runMigrations/MIGRATIONS). ESM이므로 import 시 '.js' 확장자 사용."
+  - "신규 평가 타입은 src/eval/eval-contracts.ts에 정의(contracts.ts append 금지 — 불변). GoldLabel/GoldSampleEnvelope/EvalMetricsResult/PerClassMetric/CalibrationResult/CandidateSignal/GoldSetSummary/ErrorSample 등. 단 enum(kind 'thrashing'|'false_success'|'none', gold_labels.source 'live_jsonl'|'synthetic'|'dohyun_adapted', label 'positive'|'negative')은 contracts.ts/스키마 기존 값을 import해 단일 출처 유지."
+  - "eval DB: gold_labels/eval_metrics/mock_cache는 이미 eval v1에 존재(BLOCKER C9 정본 DDL) — M6는 생성 금지, 참조·삽입·조회만. detections.is_replay도 op v1에 존재 — 참조만. M6가 추가할 것은 단 하나: eval v2 마이그레이션 append(op_main read-only ATTACH). ATTACH는 StorageLayer.open〔〕 메서드에서 eval DB 연 직후 'ATTACH DATABASE <opPath> AS op_main'(권고: migration up〔〕이 아니라 open〔〕에서, up은 시그니처 (db,embedDim) 고정이라 opPath 못받음). eval v2 up은 schema_version 마커. op_main 쓰기 차단(read-only)을 검증 테스트로 보장. migrations.test의 eval 최신버전 기대값 1→2 갱신."
+  - "불변 기준선 동결: DEFAULT_DETECTOR_CONFIG 모든 값 변경 금지(calibrate는 copy+override만, 원본 불변). op DB schema_version=2 변경 금지(M6는 op 마이그레이션 추가 안 함, eval만 v2 append). eval DB 기존 3테이블 DDL 재정의/수정 금지. MIGRATIONS 배열 append-only(기존 항목 수정/삭제 절대 금지, eval v2만 새로 append). contracts.ts 기존 타입/enum 재정의 금지. M0~M5 기존 테스트 회귀 0(시작 직전 npm test 실측치를 기준선으로 동결 — 측정값 4265 passed/205 suites, 감소·skip 금지)."
+  - "합성 골드셋 규약: 30~200 라벨, 각 클래스 >=30%(thrashing/false_success/none). none 언더샘플링, 양성 oversampling. source='synthetic' 행은 반드시 별도 태깅. 메트릭은 두 벌 — (a)실데이터-only=주 지표(M6 테스트는 합성뿐이므로 합성-only) (b)실+합성=부록. 고정 random seed로 결정론 보장."
+  - "Node.js >= 20, TypeScript ESM strict. 작은 파일(200~400줄, 800 최대). 불변성(no mutation, 새 객체 생성). zod 검증(필요 시). console.log 금지(주입 logger/구조화 이벤트, label-cli는 주입된 io.write 사용). 새 npm 의존성 추가 금지가 원칙(통계는 직접 구현 — Wilson/κ는 수식 단순). 기존 deps(better-sqlite3/zod 등)로 충분한지 우선 검토."
+  - "통합 글루 명시(M1~M5 교훈, AC로 강제): end-to-end 평가 사이클이 합성 픽스처로 동작해야 함 — 합성 세션 JSONL → mineCandidates(+seed-dohyun) → label-cli(Mock io.read/write로 라벨 입력) → gold_labels 적재 → replaySession(Mock embed/judge) → computeMetrics → calibrate → renderReportMd. 전부 임시 eval DB·Mock·합성 픽스처로 부수효과 0. 이 end-to-end 통합 테스트가 반드시 존재해야 한다."
+  - "리포트 정직성(SPEC §8 한계, renderReportMd에 인용): 참조상한(IBM F1=0.72는 목표 아님)·골드셋 규모(n=30~200 단일라벨러, Wilson CI 동반)·라벨 천장(intra-rater κ가 모델 상한)·합성 분리(실데이터-only가 결론)·캘리브 과적합(nested 외부폴드만 인용)·정량목표 미설정('정밀도 X% 달성' 약속 금지). md 리포트가 이 한계들을 명시 인용."
+
+acceptance_criteria:
+  - "src/eval/eval-contracts.ts에 평가 신규 타입(GoldLabel/GoldSampleEnvelope/EvalMetricsResult/PerClassMetric/CalibrationResult/CandidateSignal/GoldSetSummary/ErrorSample)이 정의된다. enum은 contracts.ts/스키마 기존 값 import(단일 출처). contracts.ts는 수정하지 않는다."
+  - "src/eval/metrics.ts의 computeMetrics(gold, pred, {minSupport?})가 혼동행렬→precision/recall/f1(클래스별)/macroF1/microF1/cohenKappa/balancedAccuracy를 산출하고, 클래스별 Wilson 95% CI(wilsonInterval)와 support를 포함한다. thrashing=IoU>=0.5 span매칭, false_success=anchor±5 매칭, 미발화=none 예측. 클래스당 support<15면 skipped=true+skippedReason(정성폴백). cohenKappa(confusion)도 export. 단위 테스트가 매칭규칙·소표본폴백·κ 계산을 검증."
+  - "src/eval/replay.ts의 replaySession(db, sessionId, jsonlLinesOrPath, opts)이 녹화 JSONL을 parseLine→insertParsedLines→queryEventsBySession→runStructuralGateOverEvents→hitsToTriples→runM3Pipeline(Mock embed/judge) 순서로 재구동해 DetectionRecord[]를 반환한다. dispatcher 미호출(알림 안 쏨). recordIsReplay=true면 is_replay=1 기록. 단위 테스트가 동일입력→동일출력(결정론)과 live=replay 정렬 일치를 검증."
+  - "src/eval/calibrate.ts의 calibrate(gold, goldSamples, grid, opts)가 CalibrationGrid 격자를 stratified k-fold로 탐색해 objective=macroF1 − λ·FPR_none 최대 config를 선택한다(DEFAULT_DETECTOR_CONFIG copy+override, 원본 불변). 골드셋 작으면 qualitativeFallback=true. 단위 테스트가 격자선택·기본값 불변·정성폴백을 검증."
+  - "src/eval/report.ts의 renderReportMd/renderReportJson이 EvalMetricsResult+골드셋요약+캘리브레이션+오류샘플을 md/json 리포트로 렌더한다. md는 SPEC §8 6대 한계를 명시 인용하고, 소표본 클래스는 정성분석+CI로 표기한다. 단위 테스트가 한계 인용·소표본 표기를 검증."
+  - "src/eval/mine-candidates.ts의 mineCandidates(events, {topK1,topK2})가 구조 신호만으로(judge 호출 0) thrashing/false_success 후보를 rawScore 내림차순 CandidateSignal[]로 추출한다. 단위 테스트가 합성 이벤트에서 후보 추출과 judge 미호출을 검증."
+  - "src/eval/seed-dohyun.ts의 buildDohyunSeedLabels()가 자기승인우회 5건을 하드코딩 합성 윈도우로 GoldLabel[]로 반환한다(source='dohyun_adapted', expected_signal='false_success', labeler_id='seed'). 원본 evidence-model.md/git 미접근. 단위 테스트가 5건 생성과 원본 미접근(파일 read 없음)을 검증."
+  - "src/eval/label-cli.ts의 runLabeler(db, candidatesPath, io)가 후보를 io.write로 출력하고 io.read로 라벨 입력받아 gold_labels에 적재한다(Mock io 주입 가능). 실제 stdin/stdout 미사용(주입된 io만). 단위 테스트가 Mock io로 라벨링→gold_labels 적재를 검증한다."
+  - "eval v2 마이그레이션이 src/storage/migrations.ts에 append된다(기존 항목 불변). StorageLayer.open〔〕 메서드가 eval DB 연 직후 op DB를 op_main으로 read-only ATTACH해 op_main.embeddings/vec_embeddings를 읽을 수 있다(쓰기 시도는 실패). migrations.test의 eval 최신버전 기대값이 1→2로 갱신된다. 신규 테스트가 op_main read-only ATTACH와 쓰기 차단을 검증한다."
+  - "src/eval 부수효과 격리 검증: src/eval 테스트가 합성 픽스처(tests/fixtures/synthetic-sessions)·Mock embed/judge·임시 eval DB만 사용. 실 ~/.claude·~/.dohyun·~/Desktop 경로 리터럴 0, 실 네트워크/API 0. mine-real-sessions.ts는 'MANUAL-ONLY' 헤더를 갖고 테스트 대상이 아니다(또는 fs Mock 단위테스트만)."
+  - "통합 end-to-end 테스트: 합성 세션 JSONL → mineCandidates(+seed-dohyun) → label-cli(Mock io) → gold_labels 적재 → replaySession(Mock embed/judge) → computeMetrics → calibrate → renderReportMd가 임시 eval DB·Mock·합성 픽스처로 부수효과 0으로 흐른다. md 리포트가 생성되고 메트릭이 산출된다."
+  - "npm run typecheck가 에러 없이 통과한다(tsc --noEmit 0 에러)."
+  - "npm test가 통과한다 — M0~M5 기존 테스트 회귀 0(시작 직전 실측 기준선 4265 passed 이상, 감소·skip 없음) + M6 신규 단위/통합 테스트 통과. 커버리지 목표 80%(jest threshold 60 하회 금지). 모든 테스트 합성 픽스처·Mock·임시경로로 부수효과 없이 결정론 동작."
+
+ontology_schema:
+  name: LoopBreakerM6
+  description: "M6 평가·검증 하니스가 다루는 데이터 흐름 — 골드셋 구축에서 정량 메트릭·캘리브레이션·리플레이·리포트까지. 부수효과는 테스트 밖으로 격리"
+  fields:
+    - name: GoldLabel
+      type: object
+      description: "골드셋 라벨 레코드(eval v1 gold_labels 정본 매핑). kind/subtype/label/anchor_uuid/start_uuid/end_uuid/source/expected_signal/labeler_id/label_round. span(thrashing)+point(false_success) 겸용. 메트릭 매칭의 ground truth"
+      required: true
+    - name: MetricsCalculator
+      type: object
+      description: "computeMetrics — gold↔pred 매칭(IoU span / anchor±k) → 혼동행렬 → precision/recall/f1/macroF1/κ/balancedAccuracy + Wilson CI. 소표본<15 정성폴백"
+      required: true
+    - name: CalibrationLoop
+      type: object
+      description: "calibrate — CalibrationGrid 격자를 k-fold로 탐색, objective=macroF1−λ·FPR_none, DEFAULT_DETECTOR_CONFIG copy+override. 골드셋 작으면 정성폴백"
+      required: true
+    - name: ReplayHarness
+      type: object
+      description: "replaySession — 녹화 JSONL→동일 파이프라인 재구동(parse→gate→bridge→m3, Mock embed/judge). dispatcher 스킵. is_replay 기록. live=replay 동일 정렬"
+      required: true
+    - name: CandidateExtractor
+      type: object
+      description: "mineCandidates — 구조 신호만(judge 0)으로 thrashing/false_success 후보 추출. 라벨링 입력"
+      required: true
+    - name: DohyunSeed
+      type: object
+      description: "buildDohyunSeedLabels — 자기승인우회 5건을 합성 윈도우 GoldLabel로(source='dohyun_adapted'). 원본 미접근"
+      required: true
+    - name: ReportGenerator
+      type: object
+      description: "renderReportMd/Json — 메트릭+골드셋요약+캘리브레이션→md/json. SPEC §8 6대 한계 인용, 소표본 정성표기"
+      required: true
+
+evaluation_principles:
+  - name: no_side_effects_in_eval
+    description: "M6 최우선 계약. 골드셋 마이닝 부수효과(실 ~/.claude·dohyun 원본·개인정보·실파일·실API)를 테스트 밖으로 격리. 테스트는 합성 픽스처+Mock embed/judge+임시 eval DB만, 실 마이닝은 mine-real-sessions.ts(MANUAL-ONLY) 분리. 실경로 리터럴 0, 네트워크 0, mock_cache 미스=실패"
+    weight: 0.25
+  - name: metrics_and_calibration
+    description: "정량 메트릭 정확성 — IoU span매칭(thrashing)/anchor±k(false_success)/미발화=none, precision/recall/f1/macroF1/κ/balancedAccuracy + Wilson CI, 소표본<15 정성폴백. calibrate 격자탐색 k-fold + DEFAULT_DETECTOR_CONFIG copy+override(원본 불변) + 정성폴백"
+    weight: 0.30
+  - name: glue_integration
+    description: "end-to-end 평가 사이클 — 합성JSONL→mineCandidates+dohyun시드→label-cli(Mock io)→gold_labels→replaySession(Mock)→computeMetrics→calibrate→renderReportMd가 임시DB·Mock·합성으로 부수효과0. replay가 동일 파이프라인 재구동(dispatcher 스킵). eval v2 op_main read-only ATTACH"
+    weight: 0.25
+  - name: reuse_and_contracts
+    description: "M0~M5 재사용(parser/event-store/detect/m3/hits-to-triples/Mock api/StorageLayer 재정의0, import만) + 신규타입 eval-contracts.ts(contracts 불변) + eval DB 기존 3테이블 참조만(C9 정본) + MIGRATIONS append-only(eval v2만) + 회귀0(기준선 4265 유지) + DEFAULT_DETECTOR_CONFIG 동결"
+    weight: 0.15
+  - name: honest_limitations
+    description: "리포트 정직성(SPEC §8) — 참조상한·골드셋규모·라벨천장·합성분리·캘리브 과적합·정량목표 미설정 6대 한계를 md 리포트가 명시 인용. 소표본 정성표기. '정밀도 X% 달성' 약속 금지"
+    weight: 0.05
+
+exit_conditions:
+  - name: acceptance_met
+    description: "모든 acceptance_criteria 충족"
+    criteria: "npm run typecheck(0 에러)와 npm test(기준선 4265 회귀0 + M6 신규 통과, 전부 합성/Mock/임시경로/부수효과0)가 통과하고, 합성 세션→mineCandidates+dohyun시드→label-cli(Mock io)→gold_labels→replaySession→computeMetrics→calibrate→renderReportMd end-to-end 통합테스트가 md 리포트를 산출하며, IoU/anchor 매칭·소표본 정성폴백·eval v2 op_main read-only ATTACH가 검증됨. 골드셋은 합성 30~200 클래스>=30%, 소표본<15 F1/κ 생략+정성폴백, md 리포트가 SPEC §8 6대 한계 인용"
+  - name: production_ready
+    description: "데몬(M5) + 평가 하니스(M6)가 완성되어 LoopBreaker가 운영·평가 양면으로 동작 가능한 상태"
+    criteria: "데몬 메인루프(M5)가 실세션을 처리하고, 평가 하니스(M6)가 eval.db에 골드셋·metrics·캘리브레이션·리플레이를 붙일 수 있으며, 실 마이닝 수동도구(mine-real-sessions.ts)가 준비되어 사람이 label-cli로 라벨링→calibrate/replay/report를 산출할 수 있음. 데모는 라이브+녹화 JSONL 리플레이(결정론 백업, LLM 응답 Mock)로 가능"
+
+metadata:
+  project: LoopBreaker
+  milestone: M6
+  spec_ref: docs/SPEC.md
+  builds_on: M5 (commit 5a7704a)
+  ambiguity_score: 0.20
