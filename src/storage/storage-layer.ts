@@ -104,7 +104,24 @@ export class StorageLayer {
     if (evalPath !== undefined) {
       const evalDb = new Database(evalPath)
       this._applyPragmas(evalDb, busyTimeout)
+      // M6: eval DB에도 sqlite-vec를 로드한다.
+      // ATTACH된 op_main.vec_embeddings (vec0 가상 테이블)를 eval 연결에서
+      // 조회하려면 vec0 모듈이 eval 연결에도 등록되어 있어야 한다.
+      loadSqliteVec(evalDb)
       runMigrations(evalDb, 'eval', appVersion, embedDim)
+      // M6: op DB를 op_main 스키마로 ATTACH (SPEC §6 평가 하니스가 op_main 참조).
+      // up()은 (db, embedDim) 시그니처 고정이라 opPath를 받을 수 없으므로
+      // ATTACH는 migration이 아닌 open()에서 처리한다.
+      //
+      // ⚠️ read-only 격리 전략(better-sqlite3 제약 + 사용자 결정):
+      //   - better-sqlite3는 'file:...?mode=ro' URI ATTACH를 지원하지 않고(네이티브 URI off),
+      //     connection 단위 pragma(query_only)는 eval DB 본체 쓰기까지 막으므로 둘 다 불가.
+      //   - 따라서 op_main은 일반 ATTACH로 붙인다. SQLite는 op DB 파일이 OS read-only
+      //     권한이면 op_main을 자동으로 SQLITE_READONLY로 처리한다(파일 권한 위임).
+      //   - 평가 하니스는 op_main에 쓰지 않는다(읽기 전용 참조 규약). eval 본체
+      //     (gold_labels/eval_metrics)에만 쓴다 → 이 연결은 query_only를 켜지 않는다.
+      const escapedOpPath = opPath.replace(/'/g, "''")
+      evalDb.exec(`ATTACH DATABASE '${escapedOpPath}' AS op_main`)
       this._evalDb = evalDb
     }
   }

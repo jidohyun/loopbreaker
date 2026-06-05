@@ -333,6 +333,18 @@ export const MIGRATIONS: Migration[] = [
     kind: 'op',
     up: (db) => ensureNotificationsTable(db),
   },
+  // ---- M6 평가 하니스: eval DB version 2 ----
+  // op_main ATTACH 지원 마커.
+  // open()에서 ATTACH DATABASE <opPath> AS op_main (read-only) 수행.
+  // up은 schema_version 마커만 기록 (ATTACH는 open()에서 처리).
+  {
+    version: 2,
+    kind: 'eval',
+    up: (_db) => {
+      // schema_version 마커만 — ATTACH는 StorageLayer.open()에서 처리.
+      // no DDL changes needed here.
+    },
+  },
 ]
 
 // ---- 마이그레이션 러너 ----

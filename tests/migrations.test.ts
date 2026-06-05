@@ -42,10 +42,10 @@ describe('마이그레이션 러너 — 기본 동작', () => {
     db.close()
   })
 
-  test('평가 DB 마이그레이션 후 schema_version이 1이 된다', () => {
+  test('평가 DB 마이그레이션 후 schema_version이 2가 된다 (M6 eval v2 추가)', () => {
     const db = makeDb()
     runMigrations(db, 'eval', '0.1.0', 1024)
-    expect(getSchemaVersion(db)).toBe(1)
+    expect(getSchemaVersion(db)).toBe(2)
     db.close()
   })
 
@@ -61,7 +61,7 @@ describe('마이그레이션 러너 — 기본 동작', () => {
     const db = makeDb()
     runMigrations(db, 'eval', '0.1.0', 1024)
     expect(() => runMigrations(db, 'eval', '0.1.0', 1024)).not.toThrow()
-    expect(getSchemaVersion(db)).toBe(1)
+    expect(getSchemaVersion(db)).toBe(2)
     db.close()
   })
 })
@@ -321,7 +321,7 @@ describe('마이그레이션 — DB 분리 (운영/평가, SPEC §3-1)', () => {
     runMigrations(evalDb, 'eval', '0.1.0', 1024)
 
     expect(getSchemaVersion(opDb)).toBe(2)
-    expect(getSchemaVersion(evalDb)).toBe(1)
+    expect(getSchemaVersion(evalDb)).toBe(2)
 
     opDb.close()
     evalDb.close()
@@ -508,10 +508,10 @@ describe('getAppliedMigrations — Sub-AC 6.2', () => {
     db.close()
   })
 
-  test('평가 DB 마이그레이션 후 [1]을 반환한다', () => {
+  test('평가 DB 마이그레이션 후 [1, 2]를 반환한다 (M6 eval v2 추가)', () => {
     const db = makeDb()
     runMigrations(db, 'eval', '0.1.0', 1024)
-    expect(getAppliedMigrations(db)).toEqual([1])
+    expect(getAppliedMigrations(db)).toEqual([1, 2])
     db.close()
   })
 
@@ -568,7 +568,7 @@ describe('getAppliedMigrations — Sub-AC 6.2', () => {
     runMigrations(opDb, 'op', '0.1.0', 1024)
     runMigrations(evalDb, 'eval', '0.1.0', 1024)
     expect(getAppliedMigrations(opDb)).toEqual([1, 2])
-    expect(getAppliedMigrations(evalDb)).toEqual([1])
+    expect(getAppliedMigrations(evalDb)).toEqual([1, 2])
     opDb.close()
     evalDb.close()
   })
