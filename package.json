@@ -6,11 +6,21 @@
   "engines": {
     "node": ">=20"
   },
+  "bin": {
+    "loopbreaker": "dist/cli/index.js"
+  },
+  "main": "dist/cli/index.js",
+  "files": [
+    "dist",
+    "launchd"
+  ],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-vm-modules node_modules/.bin/jest --forceExit",
     "test:coverage": "node --experimental-vm-modules node_modules/.bin/jest --coverage --forceExit",
+    "start": "node dist/cli/index.js start --foreground",
+    "daemon": "node dist/daemon/daemon-entry.js",
     "migrate:op": "node dist/storage/migrate-cli.js op",
     "migrate:eval": "node dist/storage/migrate-cli.js eval"
   },

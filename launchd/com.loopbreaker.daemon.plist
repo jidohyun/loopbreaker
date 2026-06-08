@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.loopbreaker.daemon.plist — LoopBreaker 데몬 launchd 정의 (SPEC §6.5)
+
+  설치:
+    1. dist 빌드: npm run build
+    2. 아래 ProgramArguments의 경로를 실제 node 경로와 설치 경로로 치환
+       (NODE_PATH, DAEMON_JS_PATH 플레이스홀더)
+    3. ~/Library/LaunchAgents/ 로 복사 후 load:
+       cp launchd/com.loopbreaker.daemon.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.loopbreaker.daemon.plist
+    4. 정지: launchctl unload ~/Library/LaunchAgents/com.loopbreaker.daemon.plist
+
+  KeepAlive(SuccessfulExit=false): 비정상 종료 시 재기동, 정상 종료 시 유지 안 함.
+  RunAtLoad: load 즉시 기동. ThrottleInterval: 재기동 최소 간격 10초.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.loopbreaker.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>NODE_PATH</string>
+    <string>DAEMON_JS_PATH</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>LOG_DIR/loopbreakerd.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>LOG_DIR/loopbreakerd.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- judge 단계 실 API 사용 시 키 주입 (미설정이면 Mock 폴백) -->
+    <key>ANTHROPIC_API_KEY</key>
+    <string></string>
+  </dict>
+</dict>
+</plist>
