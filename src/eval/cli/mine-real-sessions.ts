@@ -67,11 +67,21 @@ export function resolveClaudeDir(
 export function mineRealSessions(opts: MineRealOpts): CandidateSignal[] {
   const config = opts.config ?? DEFAULT_DETECTOR_CONFIG
   const minedAt = opts.minedAt ?? Date.now()
-  const files = readdirSync(opts.claudeDir).filter((f) => f.endsWith('.jsonl'))
+  // ~/.claude/projects는 프로젝트별 하위 디렉터리 구조이므로 재귀 순회한다.
+  const entries = readdirSync(opts.claudeDir, { recursive: true, withFileTypes: true })
   const all: CandidateSignal[] = []
-  for (const file of files) {
-    const { events } = loadReplayEvents(join(opts.claudeDir, file))
-    const sessionId = events[0]?.sessionId ?? file
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+    // recursive 모드의 Dirent.parentPath(또는 path)로 전체 경로 구성.
+    const parent = (entry as { parentPath?: string; path?: string }).parentPath
+      ?? (entry as { path?: string }).path
+      ?? opts.claudeDir
+    const fullPath = join(parent, entry.name)
+    const { events } = loadReplayEvents(fullPath)
+    // sessionId 도출: events에서 비어있지 않은 첫 값 우선, 없으면 파일명(.jsonl 제거).
+    // Claude Code는 <sessionId>.jsonl 명명을 쓰므로 파일명이 안정적 폴백.
+    const fromEvent = events.find((e) => e.sessionId !== undefined && e.sessionId !== '')?.sessionId
+    const sessionId = fromEvent ?? entry.name.replace(/\.jsonl$/, '')
     // StoredEvent는 NormalizedEvent를 extends — replay-session.ts와 동일 캐스팅 패턴.
     const candidates = mineCandidates(
       events as unknown as readonly StoredEvent[],
