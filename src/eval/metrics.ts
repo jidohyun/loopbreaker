@@ -418,6 +418,23 @@ export interface ThrashingMatchInput {
    * IoU 임계값 (기본 0.5 — SPEC §5 확정값 τ=0.5).
    */
   iouThreshold?: number
+  /**
+   * 구조신호 이벤트 UUID 집합 (선택).
+   *
+   * 제공 시 gold span 슬라이스를 이 집합과 교집합하여 pred 윈도우와 같은
+   * "구조신호 단위(file_edit/tool_use)"로 정규화한 뒤 IoU를 계산한다.
+   *
+   * 단위 정합 근거:
+   *   gold span = orderedUuids[start..end] 는 user/assistant/tool 등 모든 이벤트를
+   *   담는 연속 슬라이스(예: 117개)인 반면, pred 윈도우(gate.windowRefs)는 구조 게이트가
+   *   잡은 file_edit tool_use 이벤트만(예: 13개) 담는다. 두 집합의 단위가 달라
+   *   IoU가 항상 |fe|/|span| ≈ 0.1 수준으로 떨어져 동일 구간도 매칭 실패한다.
+   *   structuralUuids 로 gold span 도 file_edit 단위로 축소하면 동일 구간 IoU ≈ 1.0.
+   *
+   * 미제공 시(undefined) 기존 동작(전체 슬라이스 기준 IoU)을 그대로 유지한다.
+   * → 하위호환: 단위가 이미 일치하는 호출(합성 픽스처 등)은 영향 없음.
+   */
+  structuralUuids?: ReadonlySet<string>
 }
 
 /**
@@ -488,8 +505,12 @@ export function matchThrashing(input: ThrashingMatchInput): ThrashingMatchResult
   }
 
   // 2. gold span UUID 집합 (inclusive 양쪽 끝)
+  //    structuralUuids 제공 시 file_edit 단위로 정규화(pred 윈도우와 단위 정합).
+  const spanSlice = input.orderedUuids.slice(startIdx, endIdx + 1)
   const goldSpanUuids = new Set<string>(
-    input.orderedUuids.slice(startIdx, endIdx + 1),
+    input.structuralUuids === undefined
+      ? spanSlice
+      : spanSlice.filter((u) => input.structuralUuids!.has(u)),
   )
 
   // 3. pred 윈도우 UUID 집합
@@ -643,6 +664,27 @@ export function buildPairedLabels(input: BuildPairedLabelsInput): PairedLabelEnt
   const usedPredIndices = new Set<number>()
   const result: PairedLabelEntry[] = []
 
+  // 구조신호 UUID 집합 = 이 세션 thrashing pred 윈도우(file_edit) + gold span 양끝.
+  // gold span(연속 전체 슬라이스)을 pred와 같은 file_edit 단위로 정규화하기 위한 기준.
+  //
+  // gold start/end 도 포함하는 이유:
+  //   실 골드셋에서 gold span 양끝(start/end)은 file_edit 이벤트다(구조 후보 마이닝 산출).
+  //   pred 윈도우에 없는 gold start/end 까지 structural로 인정해야
+  //   ① 동일 구간(start/end가 pred 양끝과 일치) → 정확히 매칭
+  //   ② 부분겹침(gold에만 있는 끝 이벤트) → union에 남아 IoU 희석 → FN 유지(과탐 방지).
+  // (pred가 없으면 windowRefs 합집합은 비고 gold 끝만 남음 → 교집합 0 → 미매칭.)
+  const structuralUuids = new Set<string>()
+  for (const pred of preds) {
+    if (pred.kind !== 'thrashing') continue
+    if (pred.sessionId !== sessionId) continue
+    for (const ref of pred.windowRefs) structuralUuids.add(ref)
+  }
+  for (const gold of golds) {
+    if (gold.goldKind !== 'thrashing') continue
+    if (gold.goldStartUuid !== undefined) structuralUuids.add(gold.goldStartUuid)
+    if (gold.goldEndUuid !== undefined) structuralUuids.add(gold.goldEndUuid)
+  }
+
   // ── gold 라벨 순서대로 매칭 ──
   for (const gold of golds) {
     if (gold.goldKind === 'thrashing') {
@@ -665,6 +707,7 @@ export function buildPairedLabels(input: BuildPairedLabelsInput): PairedLabelEnt
           goldEndUuid: endUuid,
           predWindowRefs: pred.windowRefs,
           iouThreshold: τ,
+          structuralUuids,
         })
         if (mr.matched && mr.iou > bestIou) {
           bestIou = mr.iou
