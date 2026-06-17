@@ -48,10 +48,22 @@ import {
  *   - embed만 있으면 gate 결과를 기반으로 의미 신호 보강.
  *   - 조기종료(embed 미진행)면 gate 결과 그대로 반영.
  */
+/**
+ * severity → 구조신호 degrade 시 confidence 매핑.
+ * SPEC §11(degrade): 임베딩 API 단절 시 구조게이트만으로 동작.
+ * decideThresh(기본 0.7)를 넘겨 알림이 발화하도록 한다.
+ *   - critical → 0.9 (verdict-router severity 매핑상 ≥0.85 = critical)
+ *   - warning  → 0.75 (0.5~0.85 = warning, decideThresh 0.7 통과)
+ */
+function structuralDegradeConfidence(severity: 'warning' | 'critical'): number {
+  return severity === 'critical' ? 0.9 : 0.75
+}
+
 function synthesizeVerdict(
   gate: StructureGateResult,
   embed: EmbeddingSimilarityResult | undefined,
   judge: JudgeVerdict | undefined,
+  degradedConfidence?: number,
 ): DetectionVerdict {
   const signals = {
     ...(embed !== undefined ? { maxCosine: embed.maxCosine } : {}),
@@ -91,6 +103,19 @@ function synthesizeVerdict(
   }
 
   // 의미 단계 미진행 (조기 종료)
+  // degradedConfidence가 주어지면 구조신호 degrade 경로(SPEC §11):
+  // 임베딩 단절 시 thrashing을 구조신호만으로 발화시킨다.
+  if (degradedConfidence !== undefined) {
+    return {
+      kind: gate.type,
+      subtype: gate.subtype,
+      confidence: degradedConfidence,
+      signals,
+      evidence,
+      reason: `구조 게이트 발화 (${gate.subtype}), 임베딩 단절 → 구조신호만으로 판정(degrade)`,
+    }
+  }
+
   return {
     kind: gate.type,
     subtype: gate.subtype,
@@ -138,9 +163,26 @@ async function processHit(
   const gate = hit.gate
 
   // STAGE 2: 임베딩 코사인 유사도 산출
-  // fail-closed: embedClient.embed() 실패 시 예외 그대로 전파
-  const pairs = await buildEmbeddingPairs(triples, texts => embedClient.embed(texts))
-  const embed: EmbeddingSimilarityResult = computeEmbeddingSimilarityResult(pairs)
+  // SPEC §11 degrade: 임베딩 API 단절(키 없음/네트워크/캐시미스) 시,
+  //   - thrashing은 구조신호만으로도 충분 → embed 없이 구조 degrade 발화.
+  //   - false_success는 의미·judge가 본질적이므로 기존 fail-closed(폐기) 유지.
+  let embed: EmbeddingSimilarityResult
+  try {
+    const pairs = await buildEmbeddingPairs(triples, texts => embedClient.embed(texts))
+    embed = computeEmbeddingSimilarityResult(pairs)
+  } catch (err) {
+    if (gate.type === 'thrashing') {
+      const final = synthesizeVerdict(
+        gate,
+        undefined,
+        undefined,
+        structuralDegradeConfidence(gate.severity),
+      )
+      return { gate, embedError: true, degraded: true, final }
+    }
+    // false_success 등: 의미 단계 없이는 판정 불가 → fail-closed 전파
+    throw err
+  }
 
   // 의미 신호 판정
   const signal = evaluateSemanticSignal(embed, config.simThresh)

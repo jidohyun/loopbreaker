@@ -227,6 +227,16 @@ export interface DetectionRecord {
    * judgeError:true와 함께 설정된다.
    */
   deferred?: boolean
+  /**
+   * 임베딩 API 실패 시 true.
+   * SPEC §11 degrade: 임베딩 단절 시 thrashing은 구조신호만으로 판정한다.
+   */
+  embedError?: boolean
+  /**
+   * 의미·judge 단계 없이 구조신호만으로 degrade 판정했는지 여부.
+   * embedError:true와 함께 설정된다 (thrashing 한정).
+   */
+  degraded?: boolean
   /** 최종 판정 */
   final: DetectionVerdict
 }

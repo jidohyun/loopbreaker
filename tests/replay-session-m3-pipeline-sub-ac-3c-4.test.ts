@@ -298,15 +298,17 @@ describe('applyM3Pipeline (Sub-AC 3c-4)', () => {
     expect(record.final.kind).toBe('thrashing') // gate.type
   })
 
-  // ─ embed API 실패 → fail-closed → skippedCount 증가 ──────────────────────────
-  test('embed API 실패(캐시 미스) → fail-closed 건너뜀 → records 없음, skippedCount=1', async () => {
+  // ─ embed API 실패 → fail-closed → skippedCount 증가 (false_success 한정) ──────
+  // SPEC §11 degrade: thrashing은 embed 실패 시 구조신호로 degrade 발화하므로,
+  //   fail-closed(skip)는 의미·judge가 본질인 false_success에서만 성립한다.
+  test('false_success embed 실패(캐시 미스) → fail-closed 건너뜀 → records 없음, skippedCount=1', async () => {
     // MockEmbedClient에 해당 텍스트를 등록하지 않으면 EmbedClientError throw
     const embedClient = new MockEmbedClient([], DIM)
     const judgeClient = new MockJudgeClient()
 
     const tripleA = makeTriple('Edit', '/proj/missing.ts')
     const tripleB = makeTriple('Edit', '/proj/also-missing.ts')
-    const hit = makeHit(['ref-1', 'ref-2'], 'trigger-fail-embed')
+    const hit = makeHit(['ref-1', 'ref-2'], 'trigger-fail-embed', 'false_success')
 
     const result = await applyM3Pipeline([hit], [[tripleA, tripleB]], {
       embedClient,
@@ -314,10 +316,33 @@ describe('applyM3Pipeline (Sub-AC 3c-4)', () => {
       config: TEST_CONFIG_WITH_JUDGE,
     })
 
-    // embed 실패 → hit 건너뜀 → records 없음
+    // false_success embed 실패 → hit 건너뜀 → records 없음
     expect(result.records).toHaveLength(0)
     expect(result.hitCount).toBe(1)
     expect(result.skippedCount).toBe(1)
+  })
+
+  // ─ thrashing embed 실패 → 구조신호 degrade 발화 (SPEC §11) ────────────────────
+  test('thrashing embed 실패(캐시 미스) → 구조신호 degrade로 record 생성, skippedCount=0', async () => {
+    const embedClient = new MockEmbedClient([], DIM)
+    const judgeClient = new MockJudgeClient()
+
+    const tripleA = makeTriple('Edit', '/proj/missing.ts')
+    const tripleB = makeTriple('Edit', '/proj/also-missing.ts')
+    const hit = makeHit(['ref-1', 'ref-2'], 'trigger-degrade') // 기본 thrashing
+
+    const result = await applyM3Pipeline([hit], [[tripleA, tripleB]], {
+      embedClient,
+      judgeClient,
+      config: TEST_CONFIG_WITH_JUDGE,
+    })
+
+    // thrashing은 degrade로 발화 → record 1건, skip 0
+    expect(result.records).toHaveLength(1)
+    expect(result.records[0]!.degraded).toBe(true)
+    expect(result.records[0]!.embedError).toBe(true)
+    expect(result.records[0]!.final.kind).toBe('thrashing')
+    expect(result.skippedCount).toBe(0)
   })
 
   // ─ 다중 hit: 일부 embed 성공, 일부 실패 → 성공분만 records에 포함 ─────────────
@@ -350,7 +375,8 @@ describe('applyM3Pipeline (Sub-AC 3c-4)', () => {
     ])
 
     const hitOk   = makeHit(['ref-ok-a', 'ref-ok-b'],     'trigger-ok')
-    const hitFail = makeHit(['ref-fail-a', 'ref-fail-b'], 'trigger-fail')
+    // hitFail은 false_success: embed 실패 시 fail-closed skip (thrashing이면 degrade 발화함)
+    const hitFail = makeHit(['ref-fail-a', 'ref-fail-b'], 'trigger-fail', 'false_success')
 
     const result = await applyM3Pipeline(
       [hitOk, hitFail],
@@ -361,7 +387,7 @@ describe('applyM3Pipeline (Sub-AC 3c-4)', () => {
     expect(result.hitCount).toBe(2)
     // hitOk: embed 성공 → record 생성 (judge 성공 or 실패여도 record 생성됨)
     expect(result.records.length).toBeGreaterThanOrEqual(1)
-    // hitFail: embed 캐시 미스 → fail-closed skip
+    // hitFail(false_success): embed 캐시 미스 → fail-closed skip
     expect(result.skippedCount).toBeGreaterThanOrEqual(1)
     // 항등식 유지
     expect(result.hitCount).toBe(result.records.length + result.skippedCount)
@@ -502,7 +528,8 @@ describe('applyM3Pipeline (Sub-AC 3c-4)', () => {
 
     const hitGood1 = makeHit(['r1', 'r2'], 'trig-g1')
     const hitGood2 = makeHit(['r3', 'r4'], 'trig-g2')
-    const hitFail  = makeHit(['r5', 'r6'], 'trig-f')
+    // false_success: embed 실패 시 skip (thrashing이면 degrade 발화하므로 항등식 검증엔 false_success 사용)
+    const hitFail  = makeHit(['r5', 'r6'], 'trig-f', 'false_success')
 
     const tripleFail = makeTriple('Edit', '/unregistered.ts')
     const tripleFail2 = makeTriple('Edit', '/unregistered2.ts')

@@ -110,11 +110,13 @@ const BASE_CONFIG: DetectorConfig = {
   judgePositionSwaps: 0,
 }
 
-// ─── 1. embed 항상 실패 → 미발화 ────────────────────────────────────────────
+// ─── 1. embed 항상 실패 → thrashing은 구조신호 degrade, false_success는 fail-closed ──
+// SPEC §11 degrade: 임베딩 단절 시 thrashing은 구조게이트만으로 발화한다.
+//   false_success는 의미·judge가 본질적이므로 기존 fail-closed(미발화) 유지.
 
-describe('Sub-AC 7b: fail-closed — embed API 항상 실패', () => {
-  it('embed API가 항상 실패하면 DetectionRecord가 생성되지 않는다 (미발화)', async () => {
-    const hits = [makeDetectionHit()]
+describe('Sub-AC 7b/§11: embed API 항상 실패 — thrashing degrade', () => {
+  it('thrashing gate에서 embed 실패 시 구조신호 degrade로 DetectionRecord가 생성된다', async () => {
+    const hits = [makeDetectionHit()] // makeGateResult() = thrashing/warning
     const triples = [makeTriples()]
     const embedClient = new AlwaysFailEmbedClient()
     const judgeClient = new MockJudgeClient([]) // 호출되지 않아야 함
@@ -125,22 +127,52 @@ describe('Sub-AC 7b: fail-closed — embed API 항상 실패', () => {
       config: BASE_CONFIG,
     })
 
-    // fail-closed: 실패 시 DetectionRecord 생성 없음
-    expect(records).toHaveLength(0)
+    // degrade: thrashing은 embed 없이도 발화
+    expect(records).toHaveLength(1)
+    expect(records[0]!.embedError).toBe(true)
+    expect(records[0]!.degraded).toBe(true)
+    expect(records[0]!.embed).toBeUndefined()
+    expect(records[0]!.judge).toBeUndefined()
+    expect(records[0]!.final.kind).toBe('thrashing')
+    // warning severity → confidence 0.75 (decideThresh 0.7 통과)
+    expect(records[0]!.final.confidence).toBeGreaterThanOrEqual(BASE_CONFIG.decideThresh)
   })
 
-  it('embed API 실패 시 detection event가 발화하지 않는다 (빈 배열)', async () => {
-    const hits = [makeDetectionHit(), makeDetectionHit(), makeDetectionHit()]
-    const triples = [makeTriples(), makeTriples(), makeTriples()]
-    const embedClient = new AlwaysFailEmbedClient()
-    const judgeClient = new MockJudgeClient([])
+  it('critical thrashing은 degrade 시 confidence 0.9를 받는다', async () => {
+    const criticalGate = { ...makeGateResult(), severity: 'critical' as const }
+    const hits = [makeDetectionHit(criticalGate)]
+    const triples = [makeTriples()]
 
     const records = await runM3Pipeline(hits, triples, {
-      embedClient,
-      judgeClient,
+      embedClient: new AlwaysFailEmbedClient(),
+      judgeClient: new MockJudgeClient([]),
       config: BASE_CONFIG,
     })
 
+    expect(records).toHaveLength(1)
+    expect(records[0]!.final.confidence).toBe(0.9)
+  })
+
+  it('false_success gate에서 embed 실패 시 fail-closed로 미발화한다 (의미·judge 본질)', async () => {
+    const fsGate: StructureGateResult = {
+      type: 'false_success',
+      subtype: 'self_approval',
+      severity: 'critical',
+      sessionId: 'test-session',
+      agentScope: 'root',
+      windowRefs: ['uuid-1', 'uuid-2'],
+      metrics: {},
+    }
+    const hits = [makeDetectionHit(fsGate)]
+    const triples = [makeTriples()]
+
+    const records = await runM3Pipeline(hits, triples, {
+      embedClient: new AlwaysFailEmbedClient(),
+      judgeClient: new MockJudgeClient([]),
+      config: BASE_CONFIG,
+    })
+
+    // false_success는 embed 단절 시 fail-closed (degrade 안 함)
     expect(records).toHaveLength(0)
   })
 })
@@ -251,10 +283,18 @@ describe('Sub-AC 7b: fail-closed — 부분 실패 시 성공분만 누적', () 
       config: BASE_CONFIG,
     })
 
-    // hit1은 성공(DetectionRecord 생성), hit2는 실패(미발화)
-    expect(records).toHaveLength(1)
-    expect(records[0]!.gate.subtype).toBe('file_edit_loop')
-    expect(records[0]!.embed).toBeDefined()
+    // hit1은 embed 성공(정상 record), hit2는 embed 실패지만
+    // thrashing이므로 구조신호 degrade로 발화 → 둘 다 record 생성.
+    expect(records).toHaveLength(2)
+
+    const r1 = records.find((r) => r.gate.subtype === 'file_edit_loop')!
+    expect(r1.embed).toBeDefined()
+    expect(r1.degraded).toBeUndefined()
+
+    const r2 = records.find((r) => r.gate.subtype === 'err_loop')!
+    expect(r2.embedError).toBe(true)
+    expect(r2.degraded).toBe(true)
+    expect(r2.embed).toBeUndefined()
   })
 })
 
