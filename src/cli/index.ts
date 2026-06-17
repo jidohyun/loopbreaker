@@ -14,7 +14,7 @@
 // 부수효과 격리: import 시 실행되지 않는다(isMain 가드). 각 명령은 호출 시에만
 //   데몬 기동/launchd/DB 접근을 수행한다. 테스트는 dispatch(argv, io)를 Mock io로 호출.
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import Database from 'better-sqlite3'
@@ -24,6 +24,7 @@ import {
   defaultOpDbPath,
   defaultLockPath,
 } from '../daemon/daemon-entry.js'
+import { selfCheck } from '../api/self-check.js'
 
 const APP_VERSION = '0.1.0'
 
@@ -44,12 +45,13 @@ const HELP = `loopbreaker — Claude Code 세션 thrashing/false_success 탐지 
   loopbreaker <command> [options]
 
 명령:
-  start [--foreground]   데몬 기동 (--foreground: 직접 실행, 기본: 안내 출력)
-  stop                   데몬 정지 안내
-  status [--json]        데몬 상태·세션 수·최근 탐지 (ops.db read-only 조회)
-  doctor                 권한·경로·DB·설정 건강검진
-  version                버전 출력
-  help                   이 도움말
+  start [--foreground]          데몬 기동 (--foreground: 직접 실행, 기본: 안내 출력)
+  stop                          데몬 정지 안내
+  status [--json]               데몬 상태·세션 수·최근 탐지 (ops.db read-only 조회)
+  self-check <세션ID|경로> [--json]  세션 JSONL을 분석해 지금 thrashing 중인지 즉시 판정
+  doctor                        권한·경로·DB·설정 건강검진
+  version                       버전 출력
+  help                          이 도움말
 
 설정: ${defaultConfigPath()}
 운영 DB: ${defaultOpDbPath()}
@@ -169,6 +171,119 @@ function cmdDoctor(io: CliIO): number {
   return allOk ? 0 : 1
 }
 
+/** ~/.claude/projects 하위에서 <sessionId>.jsonl 파일을 재귀로 찾는다. */
+function findSessionJsonl(sessionId: string): string | null {
+  const root = join(homedir(), '.claude', 'projects')
+  if (!existsSync(root)) return null
+  const target = `${sessionId}.jsonl`
+  // 1-depth 프로젝트 디렉터리들 + 그 하위를 얕게 순회 (Claude Code 레이아웃).
+  const stack: string[] = [root]
+  while (stack.length > 0) {
+    const dir = stack.pop()!
+    let entries: string[]
+    try {
+      entries = readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of entries) {
+      const full = join(dir, name)
+      let st
+      try {
+        st = statSync(full)
+      } catch {
+        continue
+      }
+      if (st.isDirectory()) {
+        stack.push(full)
+      } else if (name === target) {
+        return full
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * self-check: 세션 JSONL을 구조 게이트로 분석해 thrashing 여부를 판정한다.
+ *
+ *   loopbreaker self-check <세션ID 또는 JSONL경로> [--json]
+ *
+ * - 인자가 .jsonl로 끝나거나 실제 파일 경로면 그 파일을 직접 분석.
+ * - 그 외에는 세션ID로 보고 ~/.claude/projects에서 <id>.jsonl을 찾는다.
+ * - 종료 코드: thrashing 없음=0, thrashing 발화=2, 입력 오류=1
+ *   (에이전트/스크립트가 exit code로 분기할 수 있도록 2를 '발화' 신호로 둔다.)
+ */
+function cmdSelfCheck(argv: readonly string[], io: CliIO): number {
+  const asJson = argv.includes('--json')
+  const arg = argv.find((a) => !a.startsWith('--'))
+
+  if (arg === undefined) {
+    io.err('사용법: loopbreaker self-check <세션ID 또는 JSONL경로> [--json]\n')
+    return 1
+  }
+
+  // 입력 해석: 파일 경로 우선, 아니면 세션ID로 탐색
+  let jsonlPath: string | null
+  if (arg.endsWith('.jsonl') || existsSync(arg)) {
+    jsonlPath = existsSync(arg) ? arg : null
+  } else {
+    jsonlPath = findSessionJsonl(arg)
+  }
+
+  if (jsonlPath === null) {
+    io.err(`세션 JSONL을 찾지 못함: ${arg}\n`)
+    return 1
+  }
+
+  let result
+  try {
+    result = selfCheck(jsonlPath)
+  } catch (err) {
+    io.err(`self-check 실패: ${String(err)}\n`)
+    return 1
+  }
+
+  if (asJson) {
+    io.out(
+      JSON.stringify(
+        {
+          thrashing: result.thrashing,
+          severity: result.severity,
+          eventCount: result.summary.eventCount,
+          hitCount: result.summary.hitCount,
+          verdict: result.summary.verdict,
+          hits: result.hits.map((h) => ({
+            subtype: h.gate.subtype,
+            severity: h.gate.severity,
+            triggerUuid: h.triggerUuid,
+            metrics: h.gate.metrics,
+            windowRefs: h.gate.windowRefs,
+          })),
+          sourcePath: jsonlPath,
+        },
+        null,
+        2,
+      ) + '\n',
+    )
+  } else {
+    const mark = result.thrashing ? '⚠️ ' : '✅'
+    io.out(`loopbreaker self-check\n`)
+    io.out(`  ${mark} ${result.summary.verdict}\n`)
+    io.out(`  소스: ${jsonlPath}\n`)
+    if (result.thrashing) {
+      io.out(`  심각도: ${result.severity}\n`)
+      for (const h of result.hits.slice(0, 5)) {
+        io.out(
+          `    - ${h.gate.subtype} (${h.gate.severity}) @ ${h.triggerUuid}` +
+            ` metrics=${JSON.stringify(h.gate.metrics)}\n`,
+        )
+      }
+    }
+  }
+  return result.thrashing ? 2 : 0
+}
+
 /** start: --foreground면 직접 실행, 아니면 안내 */
 async function cmdStart(argv: readonly string[], io: CliIO): Promise<number> {
   if (argv.includes('--foreground')) {
@@ -198,6 +313,9 @@ export async function dispatch(argv: readonly string[], io: CliIO = defaultIo): 
       return 0
     case 'status':
       return cmdStatus(rest, io)
+    case 'self-check':
+    case 'selfcheck':
+      return cmdSelfCheck(rest, io)
     case 'doctor':
       return cmdDoctor(io)
     case 'version':

@@ -7,7 +7,8 @@
     "node": ">=20"
   },
   "bin": {
-    "loopbreaker": "dist/cli/index.js"
+    "loopbreaker": "dist/cli/index.js",
+    "loopbreaker-mcp": "dist/mcp/server.js"
   },
   "main": "dist/cli/index.js",
   "files": [
@@ -20,11 +21,13 @@
     "test": "node --experimental-vm-modules node_modules/.bin/jest --forceExit",
     "test:coverage": "node --experimental-vm-modules node_modules/.bin/jest --coverage --forceExit",
     "start": "node dist/cli/index.js start --foreground",
+    "mcp": "node dist/mcp/server.js",
     "daemon": "node dist/daemon/daemon-entry.js",
     "migrate:op": "node dist/storage/migrate-cli.js op",
     "migrate:eval": "node dist/storage/migrate-cli.js eval"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node-notifier": "^8.0.5",
     "better-sqlite3": "^12.10.0",
     "chokidar": "^5.0.0",

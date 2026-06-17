@@ -3,6 +3,9 @@
 // CLI 디스패처 단위 테스트.
 // Mock CliIO로 dispatch를 호출해 부수효과 0(실 데몬 기동·launchd 없음)으로 검증.
 
+import { writeFileSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { dispatch, type CliIO } from '../src/cli/index.js'
 
 function makeIo(): { io: CliIO; out: string[]; err: string[] } {
@@ -13,6 +16,54 @@ function makeIo(): { io: CliIO; out: string[]; err: string[] } {
     out,
     err,
   }
+}
+
+/** 같은 파일을 N회 미세 반복 편집하는 thrashing JSONL 파일을 임시로 만들고 경로 반환 */
+function writeThrashingJsonl(editCount: number): string {
+  const lines: string[] = []
+  let prev: string | null = null
+  let ts = Date.parse('2026-06-17T10:00:00.000Z')
+  const push = (o: Record<string, unknown>): void => {
+    lines.push(
+      JSON.stringify({
+        ...o,
+        sessionId: 'cli-thrash',
+        cwd: '/tmp/proj',
+        isSidechain: false,
+        parentUuid: prev,
+        timestamp: new Date(ts).toISOString(),
+      }),
+    )
+    ts += 1500
+    prev = o['uuid'] as string
+  }
+  push({ type: 'user', uuid: 'u0', message: { role: 'user', content: 'go' } })
+  const vs = ['1', '2', '1', '1.0', '2', '0', '1', '3', '1', '2']
+  for (let i = 0; i < editCount; i++) {
+    push({
+      type: 'assistant',
+      uuid: `a${i + 1}`,
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool_use',
+            id: `tu-${i + 1}`,
+            name: 'Edit',
+            input: {
+              file_path: '/tmp/proj/demo.ts',
+              old_string: `function calc() { return ${vs[(i - 1 + vs.length) % vs.length]}; }`,
+              new_string: `function calc() { return ${vs[i % vs.length]}; }`,
+            },
+          },
+        ],
+      },
+    })
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'lb-cli-'))
+  const file = join(dir, 'cli-thrash.jsonl')
+  writeFileSync(file, lines.join('\n') + '\n')
+  return file
 }
 
 describe('CLI dispatch', () => {
@@ -78,5 +129,43 @@ describe('CLI dispatch', () => {
     const code = await dispatch(['stop'], io)
     expect(code).toBe(0)
     expect(out.join('')).toContain('loopbreaker stop')
+  })
+
+  test('self-check: thrashing JSONL → exit 2, ⚠️ 출력', async () => {
+    const file = writeThrashingJsonl(10)
+    const { io, out } = makeIo()
+    const code = await dispatch(['self-check', file], io)
+    expect(code).toBe(2) // 발화 신호
+    expect(out.join('')).toContain('thrashing 감지')
+    expect(out.join('')).toContain('critical')
+  })
+
+  test('self-check --json: 파싱 가능한 구조 출력', async () => {
+    const file = writeThrashingJsonl(10)
+    const { io, out } = makeIo()
+    const code = await dispatch(['self-check', file, '--json'], io)
+    expect(code).toBe(2)
+    const parsed = JSON.parse(out.join('')) as {
+      thrashing: boolean
+      severity: string
+      hits: unknown[]
+    }
+    expect(parsed.thrashing).toBe(true)
+    expect(parsed.severity).toBe('critical')
+    expect(Array.isArray(parsed.hits)).toBe(true)
+  })
+
+  test('self-check: 인자 없음 → exit 1, 사용법 안내', async () => {
+    const { io, err } = makeIo()
+    const code = await dispatch(['self-check'], io)
+    expect(code).toBe(1)
+    expect(err.join('')).toContain('사용법')
+  })
+
+  test('self-check: 존재하지 않는 세션 → exit 1', async () => {
+    const { io, err } = makeIo()
+    const code = await dispatch(['self-check', 'no-such-session-id-xyz'], io)
+    expect(code).toBe(1)
+    expect(err.join('')).toContain('찾지 못함')
   })
 })
