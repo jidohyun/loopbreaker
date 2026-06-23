@@ -67,32 +67,25 @@ src/
 
 요구사항: **Node.js 20+**, macOS.
 
-### 에이전트용 설치 (MCP 자가설치)
+### 에이전트용 설치
 
-Claude Code 같은 AI 에이전트가 LoopBreaker를 자기점검 도구로 쓰려면 MCP 서버를 등록합니다.
-**아래 블록을 그대로 실행하면** repo를 찾아 빌드하고 멱등 등록까지 됩니다(경로 하드코딩 없음):
+Claude Code 같은 AI 에이전트에게 아래 프롬프트를 그대로 주면 됩니다. 모든 설치 로직은
+`scripts/install.sh`(멱등·재실행 안전)에 있으므로, 에이전트는 그 스크립트를 실행하기만 하면 됩니다.
 
-```bash
-# 1) repo 위치 해석 (LOOPBREAKER_HOME 우선, 없으면 알려진 후보 탐색)
-LB="${LOOPBREAKER_HOME:-}"
-if [ -z "$LB" ] || [ ! -f "$LB/dist/mcp/server.js" ]; then
-  for c in ~/Desktop/Backup/loopbreaker ~/loopbreaker ~/Projects/loopbreaker; do
-    [ -f "$c/dist/mcp/server.js" ] && LB="$c" && break
-  done
-fi
-# 2) 빌드 안 돼 있으면 빌드
-[ -f "$LB/dist/mcp/server.js" ] || ( cd "$LB" && npm install && npm run build )
-# 3) 멱등 등록 (이미 있으면 갱신)
-claude mcp list | grep -q '^loopbreaker:' && claude mcp remove loopbreaker
-claude mcp add loopbreaker -- node "$LB/dist/mcp/server.js"
-```
+> **LoopBreaker 설치 프롬프트 (에이전트에게 그대로 전달):**
+>
+> LoopBreaker repo를 찾아 `scripts/install.sh`를 실행해 설치해줘.
+> 1. repo 위치는 `LOOPBREAKER_HOME` 환경변수를 먼저 보고, 없으면
+>    `~/Desktop/Backup/loopbreaker`, `~/loopbreaker`, `~/Projects/loopbreaker` 순으로 찾아.
+>    (`package.json`에 `"name": "loopbreaker"`가 있는 디렉터리가 repo 루트)
+> 2. 못 찾으면 나에게 repo 경로를 물어봐. 찾으면 그 경로로:
+>    `LOOPBREAKER_HOME=<repo> bash <repo>/scripts/install.sh` 실행.
+>    (MCP만 원하면 `--no-launchd`, 빌드만 원하면 `--build-only` 플래그)
+> 3. 설치 후 `node <repo>/dist/cli/index.js doctor`와 `claude mcp list | grep loopbreaker`로
+>    확인하고 결과를 알려줘. (Node 20+ 필요, macOS)
 
-사람이 직접 등록할 때는:
-
-```bash
-claude mcp add loopbreaker -- node "$(pwd)/dist/mcp/server.js"
-claude mcp list | grep loopbreaker          # ✔ Connected 확인
-```
+`scripts/install.sh`가 하는 일: Node 20+ 점검 → `npm install` → 빌드 → launchd 데몬 자동
+기동 등록(plist 경로 치환·`launchctl load`) → MCP 등록(`claude mcp add`). 전부 멱등.
 
 > MCP 도구(`mcp__loopbreaker__*`)는 등록 후 **다음 세션부터** 노출됩니다(현재 세션엔 즉시 안 뜸).
 > 노출 도구와 사용법은 아래 [에이전트 통합 (MCP)](#에이전트-통합-mcp) 참고.
