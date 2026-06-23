@@ -129,6 +129,54 @@ tail -f ~/Library/Logs/loopbreakerd.log                               # 로그
 > 수동 설치 시: plist의 `NODE_PATH` / `DAEMON_JS_PATH` / `LOG_DIR` 플레이스홀더를
 > 실제 경로로 치환한 뒤 `~/Library/LaunchAgents/`에 복사해야 합니다 — `scripts/install.sh`가 이를 자동화합니다.
 
+### 에이전트 통합 (MCP)
+
+LoopBreaker는 **MCP 서버**로도 동작합니다. Claude Code 같은 AI 에이전트가 작업 중에
+"내가 지금 같은 실패를 반복하며 헛돌고 있나?"를 **스스로** 물어볼 수 있습니다.
+데몬(실시간 감시)과 달리, MCP는 에이전트가 필요할 때 직접 호출하는 자기점검 도구입니다.
+
+**노출 도구 (모두 read-only, API 키 불필요):**
+
+| 도구 | 하는 일 |
+|---|---|
+| `loopbreaker_self_check` | 세션 JSONL(경로 또는 세션 ID)을 분석해 지금 thrashing 중인지 판정 |
+| `loopbreaker_status` | 데몬 상태·감시 세션 수·누적 탐지·최근 탐지 |
+| `loopbreaker_recent_detections` | 최근 탐지 목록만 추려서 반환 |
+
+**설치 (사람용):** `scripts/install.sh`가 자동 등록합니다. 수동/개별 등록은:
+
+```bash
+claude mcp add loopbreaker -- node "$(pwd)/dist/mcp/server.js"
+claude mcp list | grep loopbreaker          # ✔ Connected 확인
+```
+
+**설치 (에이전트 자가설치용 — 이 블록을 그대로 실행):**
+
+```bash
+# 1) repo 위치 해석 (LOOPBREAKER_HOME 우선, 없으면 알려진 후보 탐색)
+LB="${LOOPBREAKER_HOME:-}"
+if [ -z "$LB" ] || [ ! -f "$LB/dist/mcp/server.js" ]; then
+  for c in ~/Desktop/Backup/loopbreaker ~/loopbreaker ~/Projects/loopbreaker; do
+    [ -f "$c/dist/mcp/server.js" ] && LB="$c" && break
+  done
+fi
+# 2) 빌드 안 돼 있으면 빌드
+[ -f "$LB/dist/mcp/server.js" ] || ( cd "$LB" && npm install && npm run build )
+# 3) 멱등 등록 (이미 있으면 갱신)
+claude mcp list | grep -q '^loopbreaker:' && claude mcp remove loopbreaker
+claude mcp add loopbreaker -- node "$LB/dist/mcp/server.js"
+```
+
+> MCP 도구(`mcp__loopbreaker__*`)는 등록 후 **다음 세션부터** 노출됩니다(현재 세션엔 즉시 안 뜸).
+
+**스크립트·CI용 (MCP 없이 CLI로):** 종료 코드로 분기할 수 있습니다 — `0`=정상, `2`=thrashing 발화, `1`=입력 오류.
+
+```bash
+node dist/cli/index.js self-check <세션ID|JSONL경로> --json
+# {"thrashing":true,"severity":"critical","eventCount":11,"hitCount":6,
+#  "verdict":"thrashing 감지: 6건 …","hits":[{"subtype":"file_edit_loop",…}]}
+```
+
 ### 설정
 
 `~/.loopbreaker/config.json` (없으면 zod 기본값 사용):
