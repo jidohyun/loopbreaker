@@ -67,10 +67,34 @@ src/
 
 요구사항: **Node.js 20+**, macOS.
 
+### 자동 설치 (권장)
+
+의존성 설치 → 빌드 → launchd 자동 기동 등록 → MCP 등록을 한 번에:
+
+```bash
+git clone <repo> && cd loopbreaker
+scripts/install.sh              # 전체 (빌드 + launchd + MCP)
+scripts/install.sh --no-launchd # 빌드 + MCP만 (자동 기동 안 함)
+scripts/install.sh --build-only # 빌드만
+```
+
+멱등(재실행 안전)하며, plist 경로 치환·launchctl load·`claude mcp add`를 자동 처리합니다.
+
+제거:
+
+```bash
+scripts/uninstall.sh              # launchd·MCP 해제 + ~/.loopbreaker 삭제
+scripts/uninstall.sh --keep-state # config·DB 보존
+```
+
+repo 소스와 `~/.claude/projects/**` 세션 JSONL은 절대 건드리지 않습니다.
+
+### 수동 빌드
+
 ```bash
 npm install
 npm run build      # dist/ 생성
-npm test           # 4,705개 테스트
+npm test           # 4,700+ 테스트
 ```
 
 ---
@@ -92,20 +116,18 @@ loopbreaker help
 
 ### 백그라운드 데몬 (launchd)
 
+`scripts/install.sh`가 plist 경로 치환·등록·기동을 자동 처리합니다(위 자동 설치).
+직접 제어가 필요하면:
+
 ```bash
-# 1. 빌드
-npm run build
-
-# 2. plist의 NODE_PATH / DAEMON_JS_PATH / LOG_DIR 플레이스홀더를 실제 경로로 치환
-#    (ProgramArguments: node 경로 + dist/daemon/daemon-entry.js 경로)
-
-# 3. 설치 & 기동
-cp launchd/com.loopbreaker.daemon.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.loopbreaker.daemon.plist
-
-# 정지
-launchctl unload ~/Library/LaunchAgents/com.loopbreaker.daemon.plist
+launchctl list | grep com.loopbreaker.daemon                          # 상태
+launchctl unload ~/Library/LaunchAgents/com.loopbreaker.daemon.plist  # 정지
+launchctl load   ~/Library/LaunchAgents/com.loopbreaker.daemon.plist  # 재기동
+tail -f ~/Library/Logs/loopbreakerd.log                               # 로그
 ```
+
+> 수동 설치 시: plist의 `NODE_PATH` / `DAEMON_JS_PATH` / `LOG_DIR` 플레이스홀더를
+> 실제 경로로 치환한 뒤 `~/Library/LaunchAgents/`에 복사해야 합니다 — `scripts/install.sh`가 이를 자동화합니다.
 
 ### 설정
 
